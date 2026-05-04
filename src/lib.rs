@@ -12,6 +12,7 @@ pub mod ocr;
 pub const PROB_CUTOFF: f64 = 0.0001;
 pub const EMBEDDED_DATA_VERSION: &str = "auctionanalyzer-4.12.3";
 const VALID_ITEM_GRID_SIZES: &[i32] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18];
+const VALUE_SAMPLE_EVIDENCE_WEIGHT: f64 = 0.62;
 
 const EMBEDDED_STATIC_DATA: &str = include_str!("../data/auctionanalyzer-4.12.3/static_data.json");
 const EMBEDDED_MERGED_CSV: &[u8] = include_bytes!(
@@ -153,12 +154,18 @@ pub struct CalcParams {
     pub red_avg: Option<f64>,
     pub safety_factor: f64,
     pub max_show: usize,
-    pub revealed_count: Option<i32>,
-    pub revealed_total_value: Option<f64>,
+    pub min_value_floor: Option<f64>,
     pub manual_purple_per_item: Option<f64>,
     pub manual_purple_per_grid: Option<f64>,
     pub manual_gold_per_item: Option<f64>,
     pub manual_gold_per_grid: Option<f64>,
+    pub value_samples: Vec<ValueSample>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueSample {
+    pub count: i32,
+    pub avg_value: f64,
 }
 
 impl Default for CalcParams {
@@ -192,12 +199,12 @@ impl Default for CalcParams {
             red_avg: None,
             safety_factor: 0.85,
             max_show: 10,
-            revealed_count: None,
-            revealed_total_value: None,
+            min_value_floor: None,
             manual_purple_per_item: None,
             manual_purple_per_grid: None,
             manual_gold_per_item: None,
             manual_gold_per_grid: None,
+            value_samples: Vec::new(),
         }
     }
 }
@@ -1086,6 +1093,32 @@ impl BidKingCore {
                         if cp.gw_grid.is_none() {
                             log_w += avg_prior_log(gw, grid_gw, cp.gw_avg, 0.35);
                         }
+                        log_w += value_sample_prior_log(
+                            &cp,
+                            cp.total_count,
+                            gw,
+                            b,
+                            p,
+                            g,
+                            r,
+                            grid_p,
+                            grid_g,
+                            &price_model,
+                        );
+                        log_w += min_value_floor_prior_log(
+                            &cp,
+                            estimated_combo_value(
+                                &cp,
+                                gw,
+                                b,
+                                p,
+                                g,
+                                r,
+                                grid_p,
+                                grid_g,
+                                &price_model,
+                            ),
+                        );
                         results.push(ComboResult {
                             greenwhite_count: gw,
                             blue_count: b,
@@ -1179,6 +1212,12 @@ impl BidKingCore {
                 log_w += avg_prior_log(p, grid_p, cp.purple_avg, 0.45);
                 log_w += avg_prior_log(g, grid_g, cp.gold_avg, 0.55);
                 log_w += avg_prior_log(r, grid_r, cp.red_avg, 0.7);
+                log_w +=
+                    value_sample_prior_log(cp, total, 0, 0, p, g, r, grid_p, grid_g, &price_model);
+                log_w += min_value_floor_prior_log(
+                    cp,
+                    estimated_combo_value(cp, 0, 0, p, g, r, grid_p, grid_g, &price_model),
+                );
                 results.push(ComboResult {
                     purple_count: p,
                     gold_count: g,
@@ -1300,32 +1339,40 @@ impl BidKingCore {
             );
             let mut value = 0.0;
             if include_low_tiers {
-                value += self.high_value_for_quality(
+                value += self.quality_value(
+                    cp,
                     3,
                     b,
                     price.blue_mean,
+                    grid_b,
                     targets.blue,
                     Some(&cp.map_nest_id),
                 );
             }
-            value += self.high_value_for_quality(
+            value += self.quality_value(
+                cp,
                 4,
                 p,
                 price.purple_mean,
+                grid_p,
                 targets.purple,
                 Some(&cp.map_nest_id),
             );
-            value += self.high_value_for_quality(
+            value += self.quality_value(
+                cp,
                 5,
                 g,
                 price.gold_mean,
+                grid_g,
                 targets.gold,
                 Some(&cp.map_nest_id),
             );
-            value += self.high_value_for_quality(
+            value += self.quality_value(
+                cp,
                 6,
                 r,
                 price.red_mean,
+                grid_r,
                 targets.red,
                 Some(&cp.map_nest_id),
             );
@@ -1346,6 +1393,23 @@ impl BidKingCore {
             combo.gold_grid_est = grid_g;
             combo.red_grid_est = grid_r;
             combo.total_grid_est = grid_gw + grid_b + grid_p + grid_g + grid_r;
+        }
+    }
+
+    fn quality_value(
+        &mut self,
+        cp: &CalcParams,
+        quality: i32,
+        count: i32,
+        price_mean: f64,
+        grid_est: f64,
+        target_grid: Option<i32>,
+        drop_id: Option<&str>,
+    ) -> f64 {
+        if let Some(value) = manual_quality_total_value(cp, quality, count, grid_est) {
+            value
+        } else {
+            self.high_value_for_quality(quality, count, price_mean, target_grid, drop_id)
         }
     }
 
@@ -1648,13 +1712,9 @@ impl BidKingCore {
         let gold = self.loader.get_quality_stats(5, Some(&cp.map_nest_id));
         let red = self.loader.get_quality_stats(6, Some(&cp.map_nest_id));
         let grid = self.build_grid_stats_model(Some(&cp.map_nest_id));
-        let purple_mean = cp
-            .manual_purple_per_item
-            .or_else(|| cp.manual_purple_per_grid.map(|v| v * grid.purple_mean))
+        let purple_mean = manual_quality_unit_value(cp, 4, grid.purple_mean)
             .unwrap_or_else(|| self.quality_mean_or_fallback(purple, 4));
-        let gold_mean = cp
-            .manual_gold_per_item
-            .or_else(|| cp.manual_gold_per_grid.map(|v| v * grid.gold_mean))
+        let gold_mean = manual_quality_unit_value(cp, 5, grid.gold_mean)
             .unwrap_or_else(|| self.quality_mean_or_fallback(gold, 5));
         PriceModel {
             greenwhite_mean: self.greenwhite_mean(Some(&cp.map_nest_id), tier_weights),
@@ -1711,28 +1771,23 @@ impl BidKingCore {
         }
         let mut sorted_values: Vec<(f64, f64)> = results
             .iter()
-            .map(|r| {
-                (
-                    apply_revealed_value_adjustment(r.final_value, cp),
-                    r.probability,
-                )
-            })
+            .map(|r| (apply_min_value_floor(r.final_value, cp), r.probability))
             .collect();
         sorted_values.sort_by(|a, b| fcmp(a.0, b.0));
         let p50 = weighted_probability_quantile(&sorted_values, 0.5);
         let mut p25 = weighted_probability_quantile(&sorted_values, 0.25);
         let mut p75 = weighted_probability_quantile(&sorted_values, 0.75);
-        let ratio = unrevealed_ratio(cp);
         let variance: f64 = results
             .iter()
             .map(|r| r.high_variance * r.probability)
-            .sum::<f64>()
-            * ratio
-            * ratio;
+            .sum::<f64>();
         let sd = variance.max(0.0).sqrt();
         let lower = p50 - 0.3373 * sd;
         p25 = (p25 * 0.65).max(p25.min(lower));
         p75 = p75.max(p50 + 0.3373 * sd);
+        p25 = apply_min_value_floor(p25, cp);
+        let p50 = apply_min_value_floor(p50, cp);
+        p75 = apply_min_value_floor(p75, cp);
         (p25, p50, p75)
     }
 
@@ -1745,6 +1800,7 @@ impl BidKingCore {
                 "蓝(Q3)",
                 combo.blue_count,
                 price.blue_mean,
+                combo.blue_grid_est,
                 combo.blue_grid_value,
             ),
             (
@@ -1752,6 +1808,7 @@ impl BidKingCore {
                 "紫(Q4)",
                 combo.purple_count,
                 price.purple_mean,
+                combo.purple_grid_est,
                 combo.purple_grid_value,
             ),
             (
@@ -1759,6 +1816,7 @@ impl BidKingCore {
                 "金(Q5)",
                 combo.gold_count,
                 price.gold_mean,
+                combo.gold_grid_est,
                 combo.gold_grid_value,
             ),
             (
@@ -1766,17 +1824,20 @@ impl BidKingCore {
                 "红(Q6)",
                 combo.red_count,
                 price.red_mean,
+                combo.red_grid_est,
                 combo.red_grid_value,
             ),
         ];
         let mut lines = Vec::new();
-        for (quality, label, count, mean, grid) in qualities {
+        for (quality, label, count, mean, grid_est, grid) in qualities {
             if count <= 0 {
                 lines.push(format!("{label}: --"));
                 continue;
             }
-            let target_sum =
-                self.high_value_for_quality(quality, count, mean, grid, Some(&cp.map_nest_id));
+            let target_sum = manual_quality_total_value(cp, quality, count, grid_est)
+                .unwrap_or_else(|| {
+                    self.high_value_for_quality(quality, count, mean, grid, Some(&cp.map_nest_id))
+                });
             let pool = self.choose_pool(
                 quality,
                 target_sum / count as f64,
@@ -2350,44 +2411,236 @@ fn weighted_mean_grid(weights: &[f64]) -> f64 {
         / total
 }
 
-fn apply_revealed_value_adjustment(modeled_value: f64, cp: &CalcParams) -> f64 {
-    let Some(revealed_count) = cp.revealed_count else {
-        return modeled_value;
-    };
-    let Some(revealed_total_value) = cp.revealed_total_value else {
-        return modeled_value;
-    };
-    if revealed_count <= 0 {
-        return modeled_value;
-    }
-    let modeled_count = cp
-        .high_quality_count
-        .filter(|v| *v > 0)
-        .unwrap_or(cp.total_count);
-    if modeled_count <= 0 {
-        return modeled_value;
-    }
-    let revealed = revealed_count.min(modeled_count);
-    let ratio = (modeled_count - revealed).max(0) as f64 / modeled_count as f64;
-    revealed_total_value + modeled_value * ratio
+fn estimated_combo_value(
+    cp: &CalcParams,
+    gw: i32,
+    blue: i32,
+    purple: i32,
+    gold: i32,
+    red: i32,
+    purple_grid_est: f64,
+    gold_grid_est: f64,
+    price: &PriceModel,
+) -> f64 {
+    gw.max(0) as f64 * price.greenwhite_mean
+        + blue.max(0) as f64 * price.blue_mean
+        + quality_total_value_for_prior(cp, 4, purple, purple_grid_est, price.purple_mean)
+        + quality_total_value_for_prior(cp, 5, gold, gold_grid_est, price.gold_mean)
+        + red.max(0) as f64 * price.red_mean
 }
 
-fn unrevealed_ratio(cp: &CalcParams) -> f64 {
-    let Some(revealed_count) = cp.revealed_count else {
-        return 1.0;
+fn min_value_floor_prior_log(cp: &CalcParams, estimated_value: f64) -> f64 {
+    let Some(floor) = valid_min_value_floor(cp) else {
+        return 0.0;
     };
-    if revealed_count <= 0 || cp.revealed_total_value.is_none() {
-        return 1.0;
+    if !estimated_value.is_finite() || estimated_value >= floor {
+        return 0.0;
     }
-    let modeled_count = cp
-        .high_quality_count
-        .filter(|v| *v > 0)
-        .unwrap_or(cp.total_count);
-    if modeled_count <= 0 {
-        return 1.0;
+    let gap = floor - estimated_value.max(0.0);
+    let sigma = (floor * 0.18).max(1_500.0);
+    -0.5 * (gap / sigma).powi(2)
+}
+
+fn apply_min_value_floor(modeled_value: f64, cp: &CalcParams) -> f64 {
+    valid_min_value_floor(cp)
+        .map(|floor| modeled_value.max(floor))
+        .unwrap_or(modeled_value)
+}
+
+fn valid_min_value_floor(cp: &CalcParams) -> Option<f64> {
+    cp.min_value_floor
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn value_sample_prior_log(
+    cp: &CalcParams,
+    modeled_count: i32,
+    gw: i32,
+    blue: i32,
+    purple: i32,
+    gold: i32,
+    red: i32,
+    purple_grid_est: f64,
+    gold_grid_est: f64,
+    price: &PriceModel,
+) -> f64 {
+    if cp.value_samples.is_empty() {
+        return 0.0;
     }
-    let revealed = revealed_count.min(modeled_count);
-    (modeled_count - revealed).max(0) as f64 / modeled_count as f64
+    let population_count = (gw + blue + purple + gold + red).max(0);
+    if population_count <= 0 || modeled_count <= 0 {
+        return 0.0;
+    }
+    let (purple_mean, purple_variance) = quality_mean_and_variance_for_prior(
+        cp,
+        4,
+        purple,
+        purple_grid_est,
+        price.purple_mean,
+        price.purple_variance,
+    );
+    let (gold_mean, gold_variance) = quality_mean_and_variance_for_prior(
+        cp,
+        5,
+        gold,
+        gold_grid_est,
+        price.gold_mean,
+        price.gold_variance,
+    );
+    let qualities = [
+        (
+            gw,
+            price.greenwhite_mean,
+            fallback_value_variance(price.greenwhite_mean),
+        ),
+        (
+            blue,
+            price.blue_mean,
+            quality_variance(price.blue_mean, price.blue_variance),
+        ),
+        (purple, purple_mean, purple_variance),
+        (gold, gold_mean, gold_variance),
+        (
+            red,
+            price.red_mean,
+            quality_variance(price.red_mean, price.red_variance),
+        ),
+    ];
+    let n = population_count as f64;
+    let mut total_mean = 0.0;
+    let mut total_second = 0.0;
+    for (count, mean, variance) in qualities {
+        if count <= 0 || !mean.is_finite() {
+            continue;
+        }
+        total_mean += count as f64 * mean;
+        total_second += count as f64 * (variance.max(0.0) + mean * mean);
+    }
+    let population_mean = total_mean / n;
+    if !population_mean.is_finite() {
+        return 0.0;
+    }
+    let population_variance = (total_second / n - population_mean * population_mean).max(0.0);
+    let mut log_w = 0.0;
+    for sample in &cp.value_samples {
+        if sample.count <= 0 || sample.count > modeled_count || !sample.avg_value.is_finite() {
+            continue;
+        }
+        let sample_count = sample.count.min(population_count) as f64;
+        if sample_count <= 0.0 {
+            continue;
+        }
+        let finite_population_correction = if population_count > 1 {
+            ((population_count - sample.count.min(population_count)) as f64
+                / (population_count - 1) as f64)
+                .max(0.15)
+        } else {
+            1.0
+        };
+        let model_sigma = (population_variance / sample_count * finite_population_correction)
+            .max(0.0)
+            .sqrt();
+        let noise_floor = population_mean
+            .abs()
+            .max(sample.avg_value.abs())
+            .mul_add(0.18, 0.0)
+            .max(300.0);
+        let sigma = model_sigma.max(noise_floor);
+        let z = (sample.avg_value - population_mean) / sigma;
+        log_w += -0.5 * z * z * VALUE_SAMPLE_EVIDENCE_WEIGHT;
+    }
+    log_w
+}
+
+fn quality_variance(mean: f64, variance: f64) -> f64 {
+    if variance.is_finite() && variance > 0.0 {
+        variance
+    } else {
+        fallback_value_variance(mean)
+    }
+}
+
+fn fallback_value_variance(mean: f64) -> f64 {
+    let sigma = mean.abs().mul_add(0.7, 250.0).max(350.0);
+    sigma * sigma
+}
+
+fn quality_total_value_for_prior(
+    cp: &CalcParams,
+    quality: i32,
+    count: i32,
+    grid_est: f64,
+    fallback_mean: f64,
+) -> f64 {
+    if count <= 0 {
+        return 0.0;
+    }
+    manual_quality_total_value(cp, quality, count, grid_est)
+        .unwrap_or_else(|| count as f64 * finite_nonnegative(fallback_mean))
+}
+
+fn quality_mean_and_variance_for_prior(
+    cp: &CalcParams,
+    quality: i32,
+    count: i32,
+    grid_est: f64,
+    fallback_mean: f64,
+    fallback_variance: f64,
+) -> (f64, f64) {
+    if count > 0 {
+        if let Some(total) = manual_quality_total_value(cp, quality, count, grid_est) {
+            let mean = total / count as f64;
+            return (mean, fallback_value_variance(mean));
+        }
+    }
+    let mean = finite_nonnegative(fallback_mean);
+    (mean, quality_variance(mean, fallback_variance))
+}
+
+fn manual_quality_unit_value(cp: &CalcParams, quality: i32, average_grid_est: f64) -> Option<f64> {
+    let grid_est = if average_grid_est.is_finite() && average_grid_est > 0.0 {
+        average_grid_est
+    } else {
+        fallback_avg_grid(quality)
+    };
+    manual_quality_total_value(cp, quality, 1, grid_est)
+}
+
+fn manual_quality_total_value(
+    cp: &CalcParams,
+    quality: i32,
+    count: i32,
+    grid_est: f64,
+) -> Option<f64> {
+    if count <= 0 {
+        return None;
+    }
+    let (per_item, per_grid) = match quality {
+        4 => (cp.manual_purple_per_item, cp.manual_purple_per_grid),
+        5 => (cp.manual_gold_per_item, cp.manual_gold_per_grid),
+        _ => return None,
+    };
+    let item_total = valid_manual_value(per_item).map(|value| count as f64 * value);
+    let grid_total = valid_manual_value(per_grid)
+        .and_then(|value| grid_est.is_finite().then_some(grid_est.max(0.0) * value));
+    match (item_total, grid_total) {
+        (Some(item), Some(grid)) => Some((item + grid) / 2.0),
+        (Some(item), None) => Some(item),
+        (None, Some(grid)) => Some(grid),
+        (None, None) => None,
+    }
+}
+
+fn valid_manual_value(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn finite_nonnegative(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn beam_score(state: &BeamState, target_sum: f64, target_grid: Option<i32>) -> f64 {

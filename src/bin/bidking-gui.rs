@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
-use bidking_rs::{CalcParams, load_embedded_core, load_embedded_static_data, ocr};
+use bidking_rs::{CalcParams, ValueSample, load_embedded_core, load_embedded_static_data, ocr};
 use eframe::egui;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MAX_VISIBLE_COMBOS: usize = 10;
+const TEXT_STROKE: f32 = 1.12;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -74,6 +75,12 @@ struct CalculationOutput {
     composition_lines: Vec<String>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ValueSampleInput {
+    count: String,
+    avg_value: String,
+}
+
 struct BidKingGui {
     maps: Vec<MapRow>,
     selected_map_id: String,
@@ -104,13 +111,12 @@ struct BidKingGui {
     red_min: String,
     red_grid: String,
     red_avg: String,
-    revealed_count: String,
-    revealed_avg: String,
-    revealed_total: String,
+    min_value_floor: String,
     manual_purple_item: String,
     manual_purple_grid: String,
     manual_gold_item: String,
     manual_gold_grid: String,
+    value_samples: Vec<ValueSampleInput>,
     status: String,
     output: Option<CalculationOutput>,
     window_topmost: bool,
@@ -189,13 +195,12 @@ impl Default for BidKingGui {
             red_min: String::new(),
             red_grid: String::new(),
             red_avg: String::new(),
-            revealed_count: String::new(),
-            revealed_avg: String::new(),
-            revealed_total: String::new(),
+            min_value_floor: String::new(),
             manual_purple_item: String::new(),
             manual_purple_grid: String::new(),
             manual_gold_item: String::new(),
             manual_gold_grid: String::new(),
+            value_samples: Vec::new(),
             status: String::new(),
             output: None,
             window_topmost: false,
@@ -262,7 +267,7 @@ impl eframe::App for BidKingGui {
                         ui.add_space(8.0);
                         self.color_constraints_section(ui);
                         ui.add_space(8.0);
-                        self.revealed_section(ui);
+                        self.valuation_section(ui);
                     });
                 ui.add_space(9.0);
                 self.action_buttons(ui, ctx);
@@ -455,13 +460,9 @@ impl BidKingGui {
         });
     }
 
-    fn revealed_section(&mut self, ui: &mut egui::Ui) {
-        section(ui, "已竞出价值与手动定价", |ui| {
-            ui.columns(3, |cols| {
-                labeled_text(&mut cols[0], "已竞出件数", &mut self.revealed_count, 104.0);
-                labeled_text(&mut cols[1], "已竞出均价", &mut self.revealed_avg, 104.0);
-                labeled_text(&mut cols[2], "已竞出总价", &mut self.revealed_total, 104.0);
-            });
+    fn valuation_section(&mut self, ui: &mut egui::Ui) {
+        section(ui, "估值线索与手动定价", |ui| {
+            labeled_text(ui, "当前预估最低价格", &mut self.min_value_floor, 356.0);
             ui.add_space(8.0);
             ui.columns(2, |cols| {
                 labeled_text(
@@ -492,6 +493,40 @@ impl BidKingGui {
                     172.0,
                 );
             });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("随机样本价值线索")
+                        .strong()
+                        .color(color_gold()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("+").clicked() {
+                        self.value_samples.push(ValueSampleInput::default());
+                    }
+                });
+            });
+            let mut remove_index = None;
+            for (index, sample) in self.value_samples.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [34.0, 24.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!("{}", index + 1)).color(color_muted()),
+                        ),
+                    );
+                    field_label(ui, "件数");
+                    text_input(ui, &mut sample.count, 70.0);
+                    field_label(ui, "均价");
+                    text_input(ui, &mut sample.avg_value, 98.0);
+                    if ui.button("×").clicked() {
+                        remove_index = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove_index {
+                self.value_samples.remove(index);
+            }
         });
     }
 
@@ -572,14 +607,14 @@ impl BidKingGui {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("计算结果")
-                    .size(22.0)
+                    .size(24.0)
                     .color(color_gold())
                     .strong(),
             );
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("概率拟合 / 出价参考 / 组合反推")
-                    .size(12.0)
+                    .size(13.0)
                     .color(color_muted()),
             );
         });
@@ -774,6 +809,8 @@ impl BidKingGui {
         updated += set_if_some(&mut self.red_avg, &result.red_avg);
         updated += set_if_some(&mut self.manual_purple_item, &result.purple_avg_value);
         updated += set_if_some(&mut self.manual_gold_item, &result.gold_avg_value);
+        updated += set_if_some(&mut self.min_value_floor, &result.min_value_floor);
+        updated += self.merge_ocr_value_samples(&result.value_samples);
         updated
     }
 
@@ -837,8 +874,10 @@ impl BidKingGui {
         if total_count <= 0 {
             anyhow::bail!("请先填写大于 0 的总件数");
         }
-        let revealed_count = parse_optional_i32(&self.revealed_count)?;
-        let revealed_total_value = self.parse_revealed_total(revealed_count)?;
+        let min_value_floor = parse_optional_f64(&self.min_value_floor)?;
+        if min_value_floor.is_some_and(|value| value < 0.0) {
+            anyhow::bail!("当前预估最低价格不能为负数");
+        }
         let cp = CalcParams {
             tier: self.tier.trim().to_string(),
             map_nest_id: nest_id,
@@ -868,15 +907,18 @@ impl BidKingGui {
             min_red: parse_optional_i32(&self.red_min)?.unwrap_or_default(),
             red_grid: parse_optional_f64(&self.red_grid)?,
             red_avg: parse_optional_f64(&self.red_avg)?,
-            revealed_count,
-            revealed_total_value,
+            min_value_floor,
             manual_purple_per_item: parse_optional_f64(&self.manual_purple_item)?,
             manual_purple_per_grid: parse_optional_f64(&self.manual_purple_grid)?,
             manual_gold_per_item: parse_optional_f64(&self.manual_gold_item)?,
             manual_gold_per_grid: parse_optional_f64(&self.manual_gold_grid)?,
+            value_samples: self.parse_value_samples()?,
         };
         let results = core.run(cp.clone())?;
         let (p25, p50, p75) = core.price_range(&results, &cp);
+        let purple_range = range_for(&results, |r| r.purple_count);
+        let gold_range = range_for(&results, |r| r.gold_count);
+        let red_range = range_for(&results, |r| r.red_count);
         let composition_lines = results
             .first()
             .map(|top| core.combo_composition_lines(top, &cp))
@@ -904,9 +946,9 @@ impl BidKingGui {
                 p25: (p25 * cp.safety_factor).round() as i64,
                 p50: (p50 * cp.safety_factor).round() as i64,
                 p75: (p75 * cp.safety_factor).round() as i64,
-                purple_range: range_for(&results, |r| r.purple_count),
-                gold_range: range_for(&results, |r| r.gold_count),
-                red_range: range_for(&results, |r| r.red_count),
+                purple_range,
+                gold_range,
+                red_range,
                 rows,
                 elapsed_ms: start.elapsed().as_millis(),
                 map_label,
@@ -916,17 +958,50 @@ impl BidKingGui {
         ))
     }
 
-    fn parse_revealed_total(&self, revealed_count: Option<i32>) -> Result<Option<f64>> {
-        if let Some(total) = parse_optional_f64(&self.revealed_total)? {
-            return Ok(Some(total));
+    fn parse_value_samples(&self) -> Result<Vec<ValueSample>> {
+        let mut samples = Vec::new();
+        for (index, sample) in self.value_samples.iter().enumerate() {
+            let count_text = sample.count.trim();
+            let avg_text = sample.avg_value.trim();
+            if count_text.is_empty() && avg_text.is_empty() {
+                continue;
+            }
+            if count_text.is_empty() || avg_text.is_empty() {
+                anyhow::bail!("随机样本第 {} 行需要同时填写件数和均价", index + 1);
+            }
+            let count = count_text
+                .parse::<i32>()
+                .with_context(|| format!("随机样本第 {} 行件数不是有效整数", index + 1))?;
+            let avg_value = avg_text
+                .parse::<f64>()
+                .with_context(|| format!("随机样本第 {} 行均价不是有效数字", index + 1))?;
+            if count <= 0 {
+                anyhow::bail!("随机样本第 {} 行件数必须大于 0", index + 1);
+            }
+            if !avg_value.is_finite() || avg_value < 0.0 {
+                anyhow::bail!("随机样本第 {} 行均价不能为负数", index + 1);
+            }
+            samples.push(ValueSample { count, avg_value });
         }
-        let Some(count) = revealed_count else {
-            return Ok(None);
-        };
-        let Some(avg) = parse_optional_f64(&self.revealed_avg)? else {
-            return Ok(None);
-        };
-        Ok(Some(count as f64 * avg))
+        Ok(samples)
+    }
+
+    fn merge_ocr_value_samples(&mut self, samples: &[ocr::OcrValueSample]) -> usize {
+        let mut updated = 0;
+        for sample in samples {
+            if self.value_samples.iter().any(|existing| {
+                existing.count.trim() == sample.count.trim()
+                    && existing.avg_value.trim() == sample.avg_value.trim()
+            }) {
+                continue;
+            }
+            self.value_samples.push(ValueSampleInput {
+                count: sample.count.clone(),
+                avg_value: sample.avg_value.clone(),
+            });
+            updated += 1;
+        }
+        updated
     }
 
     fn normalize_display_count(&mut self) {
@@ -988,18 +1063,18 @@ fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) ->
                 ui.label(
                     egui::RichText::new(title)
                         .strong()
-                        .size(14.0)
+                        .size(16.0)
                         .color(color_gold()),
                 );
             });
-            ui.add_space(5.0);
+            ui.add_space(7.0);
             add(ui)
         })
         .inner
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(12.0).color(color_muted()));
+    ui.label(egui::RichText::new(text).size(13.0).color(color_muted()));
 }
 
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
@@ -1016,7 +1091,7 @@ fn readout_text(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
         .inner_margin(egui::Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.add_sized(
-                [(width - 12.0).max(20.0), 20.0],
+                [(width - 12.0).max(20.0), 24.0],
                 egui::Label::new(egui::RichText::new(value).strong().color(color_gold())),
             );
         });
@@ -1024,8 +1099,8 @@ fn readout_text(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
 
 fn table_header(ui: &mut egui::Ui, label: &str, width: f32) {
     ui.add_sized(
-        [width, 18.0],
-        egui::Label::new(egui::RichText::new(label).color(color_muted()).size(12.0)),
+        [width, 21.0],
+        egui::Label::new(egui::RichText::new(label).color(color_muted()).size(13.0)),
     );
 }
 
@@ -1040,7 +1115,7 @@ fn color_row(
 ) {
     ui.horizontal(|ui| {
         ui.add_sized(
-            [54.0, 26.0],
+            [58.0, 30.0],
             egui::Label::new(egui::RichText::new(label).strong().color(color)),
         );
         small_input(ui, count);
@@ -1060,10 +1135,10 @@ fn text_input(ui: &mut egui::Ui, value: &mut String, width: f32) {
             .fill(color_input())
             .stroke(egui::Stroke::new(1.0, color_border()))
             .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(6, 4))
+            .inner_margin(egui::Margin::symmetric(7, 5))
             .show(ui, |ui| {
                 ui.add_sized(
-                    [(width - 12.0).max(20.0), 20.0],
+                    [(width - 14.0).max(20.0), 24.0],
                     egui::TextEdit::singleline(value).frame(false),
                 );
             });
@@ -1084,7 +1159,7 @@ fn action_button(
                 .strong()
                 .color(text_color),
         )
-        .min_size(egui::vec2(width, 42.0))
+        .min_size(egui::vec2(width, 46.0))
         .fill(fill)
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6),
@@ -1098,7 +1173,7 @@ fn pill_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).strong().size(12.0).color(accent));
+            ui.label(egui::RichText::new(text).strong().size(13.0).color(accent));
         });
 }
 
@@ -1109,7 +1184,7 @@ fn status_bar(ui: &mut egui::Ui, text: &str) {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).color(color_muted()));
+            ui.label(egui::RichText::new(text).size(14.0).color(color_muted()));
         });
 }
 
@@ -1132,23 +1207,23 @@ fn force_dark_visuals(ui: &mut egui::Ui) {
     visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     visuals.widgets.noninteractive.bg_fill = color_panel();
     visuals.widgets.noninteractive.weak_bg_fill = color_panel();
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, color_text());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     visuals.widgets.inactive.bg_fill = color_input();
     visuals.widgets.inactive.weak_bg_fill = color_input();
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, color_border());
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, color_text());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     visuals.widgets.hovered.bg_fill = color_panel_alt();
     visuals.widgets.hovered.weak_bg_fill = color_panel_alt();
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, color_muted());
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, color_text());
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     visuals.widgets.active.bg_fill = color_panel_alt();
     visuals.widgets.active.weak_bg_fill = color_panel_alt();
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, color_blue());
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, color_text());
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     visuals.widgets.open.bg_fill = color_panel_alt();
     visuals.widgets.open.weak_bg_fill = color_panel_alt();
     visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, color_border());
-    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, color_text());
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
 }
 
 fn empty_results(ui: &mut egui::Ui) {
@@ -1214,7 +1289,7 @@ fn high_range_row(ui: &mut egui::Ui, output: &CalculationOutput) {
 
 fn range_label(ui: &mut egui::Ui, label: &str, range: Option<CountRange>, color: egui::Color32) {
     ui.vertical(|ui| {
-        ui.label(egui::RichText::new(label).size(12.0).color(color_muted()));
+        ui.label(egui::RichText::new(label).size(13.0).color(color_muted()));
         let text = range
             .map(|r| format!("{} ~ {}", r.min, r.max))
             .unwrap_or_else(|| "--".to_string());
@@ -1231,10 +1306,10 @@ fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(label).color(color_muted()).size(12.0));
+                ui.label(egui::RichText::new(label).color(color_muted()).size(13.0));
                 ui.label(
                     egui::RichText::new(format_number(value))
-                        .size(28.0)
+                        .size(30.0)
                         .strong()
                         .color(accent),
                 );
@@ -1252,10 +1327,10 @@ fn price_placeholder(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new(label).color(color_muted()).size(12.0));
+                ui.label(egui::RichText::new(label).color(color_muted()).size(13.0));
                 ui.label(
                     egui::RichText::new("--")
-                        .size(28.0)
+                        .size(30.0)
                         .strong()
                         .color(color_muted()),
                 );
@@ -1285,6 +1360,7 @@ fn result_table(ui: &mut egui::Ui, rows: &[UiCombo]) {
             egui::Grid::new("result_grid")
                 .striped(true)
                 .min_col_width(col_width)
+                .min_row_height(25.0)
                 .num_columns(8)
                 .show(ui, |ui| {
                     table_head(ui, "绿白", color_gold());
@@ -1333,6 +1409,7 @@ fn empty_table(ui: &mut egui::Ui) {
             egui::Grid::new("empty_result_grid")
                 .striped(true)
                 .min_col_width(col_width)
+                .min_row_height(25.0)
                 .num_columns(8)
                 .show(ui, |ui| {
                     table_head(ui, "绿白", color_gold());
@@ -1701,8 +1778,28 @@ fn start_global_hotkeys(_ctx: egui::Context) -> Result<GlobalHotkeys> {
 
 fn install_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(24.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::new(14.0, egui::FontFamily::Monospace),
+    );
+    style.spacing.item_spacing = egui::vec2(8.0, 9.0);
+    style.spacing.button_padding = egui::vec2(13.0, 8.0);
     style.spacing.window_margin = egui::Margin::same(10);
     style.spacing.indent = 16.0;
     style.visuals = egui::Visuals::dark();
@@ -1713,28 +1810,29 @@ fn install_style(ctx: &egui::Context) {
     style.visuals.widgets.inactive.bg_fill = color_input();
     style.visuals.widgets.inactive.weak_bg_fill = color_input();
     style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, color_border());
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, color_text());
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     style.visuals.widgets.hovered.bg_fill = color_panel_alt();
     style.visuals.widgets.hovered.weak_bg_fill = color_panel_alt();
     style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, color_muted());
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, color_text());
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     style.visuals.widgets.active.bg_fill = color_panel_alt();
     style.visuals.widgets.active.weak_bg_fill = color_panel_alt();
     style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, color_blue());
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, color_text());
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     style.visuals.widgets.open.bg_fill = color_panel_alt();
     style.visuals.widgets.open.weak_bg_fill = color_panel_alt();
-    style.visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, color_text());
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, color_text());
+    style.visuals.widgets.open.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(TEXT_STROKE, color_text());
     ctx.set_style(style);
 }
 
 fn install_chinese_font(ctx: &egui::Context) {
     let candidates = [
-        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\Deng.ttf",
+        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
     ];
     let Some((path, bytes)) = candidates
@@ -1797,7 +1895,7 @@ fn color_text() -> egui::Color32 {
 }
 
 fn color_muted() -> egui::Color32 {
-    egui::Color32::from_rgb(145, 170, 199)
+    egui::Color32::from_rgb(168, 193, 220)
 }
 
 fn color_gold() -> egui::Color32 {

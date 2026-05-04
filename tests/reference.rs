@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bidking_rs::{CalcParams, load_core, load_embedded_core};
+use bidking_rs::{CalcParams, ValueSample, load_core, load_embedded_core};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -129,6 +129,265 @@ fn embedded_data_case_2101_total_63() -> Result<()> {
         ),
         (39, 18, 5, 1, 0)
     );
+    Ok(())
+}
+
+#[test]
+fn manual_purple_and_gold_prices_affect_value_estimates() -> Result<()> {
+    let base = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2001".to_string(),
+        total_count: 63,
+        safety_factor: 1.0,
+        max_show: 1,
+        ..Default::default()
+    };
+
+    let mut core = load_embedded_core()?;
+    let base_results = core.run(base.clone())?;
+    let (base_p25, base_p50, base_p75) = core.price_range(&base_results, &base);
+    let base_top = base_results.first().context("base produced no combos")?;
+
+    let manual = CalcParams {
+        manual_purple_per_item: Some(1_000_000.0),
+        manual_gold_per_grid: Some(100_000.0),
+        ..base
+    };
+    let mut core = load_embedded_core()?;
+    let manual_results = core.run(manual.clone())?;
+    let (manual_p25, manual_p50, manual_p75) = core.price_range(&manual_results, &manual);
+    let manual_top = manual_results
+        .first()
+        .context("manual-price case produced no combos")?;
+
+    assert_eq!(base_results.len(), manual_results.len());
+    assert_eq!(
+        (
+            base_top.greenwhite_count,
+            base_top.blue_count,
+            base_top.purple_count,
+            base_top.gold_count,
+            base_top.red_count
+        ),
+        (
+            manual_top.greenwhite_count,
+            manual_top.blue_count,
+            manual_top.purple_count,
+            manual_top.gold_count,
+            manual_top.red_count
+        )
+    );
+    assert!(manual_top.final_value > base_top.final_value + 4_500_000.0);
+    assert!(manual_p25 > base_p25 + 1_500_000.0);
+    assert!(manual_p50 > base_p50 + 2_500_000.0);
+    assert!(manual_p75 > base_p75 + 4_000_000.0);
+    Ok(())
+}
+
+#[test]
+fn manual_per_grid_price_still_affects_estimates_when_per_item_is_filled() -> Result<()> {
+    let manual_low_grid = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2001".to_string(),
+        total_count: 23,
+        purple_count: Some(6),
+        purple_grid: Some(12.0),
+        purple_avg: Some(2.0),
+        gold_avg: Some(1.0),
+        manual_purple_per_item: Some(5_266.0),
+        manual_purple_per_grid: Some(100.0),
+        manual_gold_per_item: Some(7_856.0),
+        manual_gold_per_grid: Some(100.0),
+        safety_factor: 1.0,
+        max_show: 1,
+        ..Default::default()
+    };
+
+    let manual_high_grid = CalcParams {
+        manual_purple_per_grid: Some(10_000.0),
+        manual_gold_per_grid: Some(10_000.0),
+        ..manual_low_grid.clone()
+    };
+
+    let mut core = load_embedded_core()?;
+    let low_results = core.run(manual_low_grid.clone())?;
+    let low_top = low_results
+        .first()
+        .context("low per-grid case produced no combos")?;
+    let (low_p25, low_p50, low_p75) = core.price_range(&low_results, &manual_low_grid);
+
+    let mut core = load_embedded_core()?;
+    let high_results = core.run(manual_high_grid.clone())?;
+    let high_top = high_results
+        .first()
+        .context("high per-grid case produced no combos")?;
+    let (high_p25, high_p50, high_p75) = core.price_range(&high_results, &manual_high_grid);
+
+    assert_eq!(low_results.len(), high_results.len());
+    assert!(high_top.final_value > low_top.final_value + 50_000.0);
+    assert!(high_p25 > low_p25 + 20_000.0);
+    assert!(high_p50 > low_p50 + 20_000.0);
+    assert!(high_p75 > low_p75 + 20_000.0);
+    Ok(())
+}
+
+#[test]
+fn random_value_samples_shift_probability_weighting() -> Result<()> {
+    let base = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2005".to_string(),
+        total_count: 23,
+        total_grid_target: Some(57.0),
+        purple_count: Some(6),
+        purple_grid: Some(12.0),
+        purple_avg: Some(2.0),
+        gold_avg: Some(1.0),
+        safety_factor: 1.0,
+        max_show: 1,
+        ..Default::default()
+    };
+
+    let sampled = CalcParams {
+        value_samples: vec![
+            ValueSample {
+                count: 3,
+                avg_value: 611.33,
+            },
+            ValueSample {
+                count: 6,
+                avg_value: 1412.21,
+            },
+        ],
+        ..base.clone()
+    };
+
+    let mut core = load_embedded_core()?;
+    let base_results = core.run(base.clone())?;
+    let (base_p25, base_p50, base_p75) = core.price_range(&base_results, &base);
+
+    let mut core = load_embedded_core()?;
+    let sampled_results = core.run(sampled.clone())?;
+    let (sampled_p25, sampled_p50, sampled_p75) = core.price_range(&sampled_results, &sampled);
+
+    assert!(!base_results.is_empty());
+    assert!(!sampled_results.is_empty());
+    assert!(sampled_p75 < base_p75);
+    assert!(
+        (sampled_p25 - base_p25).abs()
+            + (sampled_p50 - base_p50).abs()
+            + (sampled_p75 - base_p75).abs()
+            > 50.0
+    );
+    Ok(())
+}
+
+#[test]
+fn min_value_floor_sets_total_value_lower_bound() -> Result<()> {
+    let base = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2005".to_string(),
+        total_count: 23,
+        total_grid_target: Some(57.0),
+        purple_count: Some(6),
+        purple_grid: Some(12.0),
+        purple_avg: Some(2.0),
+        gold_avg: Some(1.0),
+        safety_factor: 1.0,
+        max_show: 1,
+        ..Default::default()
+    };
+    let floor = 60_000.0;
+    let with_floor = CalcParams {
+        min_value_floor: Some(floor),
+        ..base.clone()
+    };
+
+    let mut core = load_embedded_core()?;
+    let base_results = core.run(base.clone())?;
+    let (base_p25, base_p50, _) = core.price_range(&base_results, &base);
+
+    let mut core = load_embedded_core()?;
+    let floor_results = core.run(with_floor.clone())?;
+    let (floor_p25, floor_p50, floor_p75) = core.price_range(&floor_results, &with_floor);
+
+    assert!(base_p25 < floor);
+    assert!(base_p50 < floor);
+    assert!(floor_p25 >= floor);
+    assert!(floor_p50 >= floor);
+    assert!(floor_p75 >= floor);
+    Ok(())
+}
+
+#[test]
+fn modified_model_preserves_core_invariants() -> Result<()> {
+    let mut core = load_embedded_core()?;
+    let floor = 60_000.0;
+    let cp = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2005".to_string(),
+        total_count: 23,
+        total_grid_target: Some(57.0),
+        purple_count: Some(6),
+        purple_grid: Some(12.0),
+        purple_avg: Some(2.0),
+        gold_avg: Some(1.0),
+        min_value_floor: Some(floor),
+        manual_purple_per_item: Some(5_266.0),
+        manual_purple_per_grid: Some(586.0),
+        manual_gold_per_item: Some(7_856.0),
+        manual_gold_per_grid: Some(589.0),
+        value_samples: vec![
+            ValueSample {
+                count: 3,
+                avg_value: 611.33,
+            },
+            ValueSample {
+                count: 6,
+                avg_value: 1412.21,
+            },
+        ],
+        safety_factor: 1.0,
+        max_show: 10,
+        ..Default::default()
+    };
+
+    let results = core.run(cp.clone())?;
+    assert!(!results.is_empty());
+    assert!(!core.raw_results.is_empty());
+
+    let raw_probability_sum: f64 = core.raw_results.iter().map(|combo| combo.probability).sum();
+    let shown_probability_sum: f64 = results.iter().map(|combo| combo.probability).sum();
+    assert!((raw_probability_sum - 1.0).abs() < 1e-9);
+    assert!((shown_probability_sum - 1.0).abs() < 1e-9);
+
+    for combo in &results {
+        assert_eq!(
+            combo.greenwhite_count
+                + combo.blue_count
+                + combo.purple_count
+                + combo.gold_count
+                + combo.red_count,
+            cp.total_count
+        );
+        assert_eq!(combo.purple_count, 6);
+        assert!((combo.purple_grid_est - 12.0).abs() < 1e-9);
+        assert!(combo.probability.is_finite());
+        assert!(combo.probability >= 0.0);
+        assert!(combo.final_value.is_finite());
+        assert!(combo.final_value >= 0.0);
+        assert!(combo.total_grid_est.is_finite());
+        assert!(combo.total_grid_est >= 0.0);
+    }
+
+    let (p25, p50, p75) = core.price_range(&results, &cp);
+    assert!(p25.is_finite());
+    assert!(p50.is_finite());
+    assert!(p75.is_finite());
+    assert!(p25 <= p50);
+    assert!(p50 <= p75);
+    assert!(p25 >= floor);
+    assert!(p50 >= floor);
+    assert!(p75 >= floor);
     Ok(())
 }
 

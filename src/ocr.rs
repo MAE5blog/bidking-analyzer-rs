@@ -91,8 +91,16 @@ pub struct OcrResult {
     pub purple_avg_value: Option<String>,
     pub gold_avg_value: Option<String>,
     pub red_avg_value: Option<String>,
+    pub min_value_floor: Option<String>,
+    pub value_samples: Vec<OcrValueSample>,
     pub map_name: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcrValueSample {
+    pub count: String,
+    pub avg_value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -112,9 +120,42 @@ pub fn default_capture_rect(screen_width: u32, screen_height: u32) -> CaptureRec
     }
 }
 
+pub fn default_min_value_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+    CaptureRect {
+        x: (screen_width as f64 * 0.66) as u32,
+        y: (screen_height as f64 * 0.80) as u32,
+        width: (screen_width as f64 * 0.33) as u32,
+        height: (screen_height as f64 * 0.12) as u32,
+    }
+}
+
 pub fn crop_info_region(image: &DynamicImage) -> DynamicImage {
     let (screen_width, screen_height) = image.dimensions();
     let rect = default_capture_rect(screen_width, screen_height);
+    crop_region(image, rect)
+}
+
+pub fn crop_min_value_region(image: &DynamicImage) -> DynamicImage {
+    let (screen_width, screen_height) = image.dimensions();
+    let rect = default_min_value_rect(screen_width, screen_height);
+    crop_region(image, rect)
+}
+
+pub fn crop_ocr_regions(image: &DynamicImage) -> RgbImage {
+    let info = crop_info_region(image).to_rgb8();
+    let min_value = crop_min_value_region(image).to_rgb8();
+    stitch_regions(&[info, min_value])
+}
+
+pub fn capture_primary_screen_info_region() -> Result<RgbImage> {
+    let (screen_width, screen_height) = primary_screen_size()?;
+    let info = capture_screen_rect(default_capture_rect(screen_width, screen_height))?;
+    let min_value = capture_screen_rect(default_min_value_rect(screen_width, screen_height))?;
+    Ok(stitch_regions(&[info, min_value]))
+}
+
+fn crop_region(image: &DynamicImage, rect: CaptureRect) -> DynamicImage {
+    let (screen_width, screen_height) = image.dimensions();
     let x = rect.x.min(screen_width.saturating_sub(1));
     let y = rect.y.min(screen_height.saturating_sub(1));
     let width = rect.width.min(screen_width.saturating_sub(x)).max(1);
@@ -122,9 +163,25 @@ pub fn crop_info_region(image: &DynamicImage) -> DynamicImage {
     image.crop_imm(x, y, width, height)
 }
 
-pub fn capture_primary_screen_info_region() -> Result<RgbImage> {
-    let (screen_width, screen_height) = primary_screen_size()?;
-    capture_screen_rect(default_capture_rect(screen_width, screen_height))
+fn stitch_regions(regions: &[RgbImage]) -> RgbImage {
+    let width = regions
+        .iter()
+        .map(|image| image.width())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let height = regions
+        .iter()
+        .map(|image| image.height())
+        .sum::<u32>()
+        .max(1);
+    let mut canvas = RgbImage::from_pixel(width, height, Rgb([0, 0, 0]));
+    let mut y = 0;
+    for region in regions {
+        image::imageops::replace(&mut canvas, region, 0, y as i64);
+        y += region.height();
+    }
+    canvas
 }
 
 #[cfg(target_os = "windows")]
@@ -255,7 +312,7 @@ pub fn scan_screenshot_with_ppocrv4_onnx(
     let image_path = image_path.as_ref();
     let image =
         image::open(image_path).with_context(|| format!("open {}", image_path.display()))?;
-    let crop = crop_info_region(&image).to_rgb8();
+    let crop = crop_ocr_regions(&image);
     run_ppocrv4_onnx(crop, image_path, fallback_ceiling)
 }
 
@@ -478,6 +535,8 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
     );
     result.purple_avg_value = try_match(&text, r"所有紫色品质藏品的平均价值约为.*?([\d\.]+)");
     result.red_avg_value = try_match(&text, r"所有红色品质藏品的平均价值约为.*?([\d\.]+)");
+    result.min_value_floor = min_value_floor_match(&text);
+    result.value_samples = value_sample_matches(&text);
 
     result.total_all = fix_trailing_noise(result.total_all, 150);
     let total_count = result
@@ -500,6 +559,12 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
             fix_color_count_overflow(result.red_count, total_count, "红色", &mut result.warnings);
         result.wg_count =
             fix_color_count_overflow(result.wg_count, total_count, "白绿", &mut result.warnings);
+        result.value_samples.retain(|sample| {
+            sample
+                .count
+                .parse::<i32>()
+                .is_ok_and(|count| count <= total_count)
+        });
     }
     result.global_grid_total = fix_trailing_noise(result.global_grid_total, 3000);
     result.blue_grid = fix_trailing_noise(result.blue_grid, 120);
@@ -547,6 +612,75 @@ fn try_match(text: &str, pattern: &str) -> Option<String> {
         .and_then(|captures| captures.get(1))
         .map(|m| m.as_str().trim_matches('.').to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn value_sample_matches(text: &str) -> Vec<OcrValueSample> {
+    let Ok(re) = Regex::new(
+        r"随机(?:选择|显示|抽取|挑选)的?(\d+)件(?:藏品|道具)平均价值(?:约为|为).*?([\d\.]+)",
+    ) else {
+        return Vec::new();
+    };
+    let mut samples = Vec::new();
+    for captures in re.captures_iter(text) {
+        let Some(count) = captures.get(1) else {
+            continue;
+        };
+        let Some(avg_value) = captures.get(2) else {
+            continue;
+        };
+        let sample = OcrValueSample {
+            count: count.as_str().trim_matches('.').to_string(),
+            avg_value: avg_value.as_str().trim_matches('.').to_string(),
+        };
+        if sample.count.is_empty() || sample.avg_value.is_empty() {
+            continue;
+        }
+        if !samples.iter().any(|existing| existing == &sample) {
+            samples.push(sample);
+        }
+    }
+    samples
+}
+
+fn min_value_floor_match(text: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?:当前预估最低价格|当前估值最低价格|当前预估最低价|预估最低价格|估值最低价格)[^\d]{0,8}(\d[\d\.]*)",
+    )
+    .ok()?;
+    let raw = re
+        .captures(text)
+        .and_then(|captures| captures.get(1))
+        .map(|m| m.as_str())?;
+    normalize_price_number(raw)
+}
+
+fn normalize_price_number(raw: &str) -> Option<String> {
+    let raw = raw.trim_matches('.');
+    if raw.is_empty() {
+        return None;
+    }
+    let groups = raw
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if groups.len() > 1
+        && (1..=3).contains(&groups[0].len())
+        && groups[1..]
+            .iter()
+            .all(|part| part.len() == 3 && part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        let value = groups.join("");
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    let value = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>()
+        .trim_matches('.')
+        .to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn fix_color_count_overflow(

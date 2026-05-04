@@ -51,6 +51,8 @@ struct CalcArgs {
     #[arg(long, default_value_t = 10)]
     max_show: usize,
     #[arg(long)]
+    min_value_floor: Option<f64>,
+    #[arg(long)]
     high_quality_count: Option<i32>,
     #[arg(long)]
     gw_count: Option<i32>,
@@ -226,6 +228,13 @@ fn print_ocr_scan(scan: ocr::OcrScan) {
     print_field("purple_avg_value", scan.parsed.purple_avg_value.as_deref());
     print_field("gold_avg_value", scan.parsed.gold_avg_value.as_deref());
     print_field("red_avg_value", scan.parsed.red_avg_value.as_deref());
+    print_field("min_value_floor", scan.parsed.min_value_floor.as_deref());
+    for sample in &scan.parsed.value_samples {
+        println!(
+            "value_sample=count:{} avg:{}",
+            sample.count, sample.avg_value
+        );
+    }
     for warning in &scan.parsed.warnings {
         println!("warning={warning}");
     }
@@ -279,6 +288,7 @@ fn run_calc(args: CalcArgs) -> Result<()> {
         red_avg: args.red_avg,
         safety_factor: args.safety,
         max_show: args.max_show,
+        min_value_floor: args.min_value_floor,
         ..Default::default()
     };
     let results = core.run(cp.clone())?;

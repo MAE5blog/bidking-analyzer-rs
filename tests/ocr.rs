@@ -1,4 +1,6 @@
-use bidking_rs::ocr::{default_capture_rect, normalize_ocr_text, parse_ocr_lines};
+use bidking_rs::ocr::{
+    default_capture_rect, default_min_value_rect, normalize_ocr_text, parse_ocr_lines,
+};
 
 #[test]
 fn capture_rect_matches_original_ratio_for_1080p() {
@@ -9,6 +11,19 @@ fn capture_rect_matches_original_ratio_for_1080p() {
             y: 113,
             width: 710,
             height: 685,
+        }
+    );
+}
+
+#[test]
+fn min_value_capture_rect_matches_right_loot_panel_for_1080p() {
+    assert_eq!(
+        default_min_value_rect(1920, 1080),
+        bidking_rs::ocr::CaptureRect {
+            x: 1267,
+            y: 864,
+            width: 633,
+            height: 129,
         }
     );
 }
@@ -27,6 +42,45 @@ fn parser_handles_original_style_lines() {
     assert_eq!(result.map_name.as_deref(), Some("小区快递"));
     assert_eq!(result.total_all.as_deref(), Some("23"));
     assert_eq!(result.gold_avg.as_deref(), Some("1"));
+}
+
+#[test]
+fn parser_keeps_multiple_random_value_samples() {
+    let lines = vec![
+        "硬核资产仓库:竞拍信息".to_string(),
+        "本次竞拍的总藏品数量为63件".to_string(),
+        "随机选择的3件藏品平均价值约为611.33".to_string(),
+        "随机选择的6件藏品平均价值约为1412.21".to_string(),
+    ];
+
+    let result = parse_ocr_lines(&lines, None);
+
+    assert_eq!(result.value_samples.len(), 2);
+    assert_eq!(result.value_samples[0].count, "3");
+    assert_eq!(result.value_samples[0].avg_value, "611.33");
+    assert_eq!(result.value_samples[1].count, "6");
+    assert_eq!(result.value_samples[1].avg_value, "1412.21");
+}
+
+#[test]
+fn parser_extracts_current_min_value_floor() {
+    let lines = vec![
+        "战利品".to_string(),
+        "当前预估最低价格： 10,114".to_string(),
+    ];
+
+    let result = parse_ocr_lines(&lines, None);
+
+    assert_eq!(result.min_value_floor.as_deref(), Some("10114"));
+}
+
+#[test]
+fn parser_treats_dot_grouped_min_value_as_thousands() {
+    let lines = vec!["当前预估最低价格:10.114".to_string()];
+
+    let result = parse_ocr_lines(&lines, None);
+
+    assert_eq!(result.min_value_floor.as_deref(), Some("10114"));
 }
 
 #[test]
