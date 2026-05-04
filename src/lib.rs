@@ -10,11 +10,12 @@ pub mod importer;
 pub mod ocr;
 
 pub const PROB_CUTOFF: f64 = 0.0001;
-pub const EMBEDDED_DATA_VERSION: &str = "auctionanalyzer-4.12.2";
+pub const EMBEDDED_DATA_VERSION: &str = "auctionanalyzer-4.12.3";
+const VALID_ITEM_GRID_SIZES: &[i32] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16, 18];
 
-const EMBEDDED_STATIC_DATA: &str = include_str!("../data/auctionanalyzer-4.12.2/static_data.json");
+const EMBEDDED_STATIC_DATA: &str = include_str!("../data/auctionanalyzer-4.12.3/static_data.json");
 const EMBEDDED_MERGED_CSV: &[u8] = include_bytes!(
-    "../data/auctionanalyzer-4.12.2/resources/MapBidCalculator.calculator_data_merged.csv"
+    "../data/auctionanalyzer-4.12.3/resources/MapBidCalculator.calculator_data_merged.csv"
 );
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2044,6 +2045,14 @@ fn build_valid_color_counts(
 
 fn is_valid_color_count(count: i32, grid: Option<f64>, avg: Option<f64>) -> bool {
     let rounded_grid = grid.map(round_to_i32);
+    if let Some(avg) = avg {
+        if avg <= 0.0 {
+            if count == 0 {
+                return rounded_grid.map(|grid| grid == 0).unwrap_or(true);
+            }
+            return false;
+        }
+    }
     if let Some(rounded_grid) = rounded_grid {
         if count == 0 {
             if rounded_grid == 0 {
@@ -2054,6 +2063,9 @@ fn is_valid_color_count(count: i32, grid: Option<f64>, avg: Option<f64>) -> bool
         if rounded_grid < count || rounded_grid > 18 * count {
             return false;
         }
+        if !can_compose_grid_total(count, rounded_grid) {
+            return false;
+        }
         if avg.is_some() && !avg_match(rounded_grid, count, avg) {
             return false;
         }
@@ -2062,6 +2074,9 @@ fn is_valid_color_count(count: i32, grid: Option<f64>, avg: Option<f64>) -> bool
             return avg == 0.0;
         }
         if !avg_count_match(count, avg) {
+            return false;
+        }
+        if !avg_can_map_to_composable_grid(count, avg) {
             return false;
         }
     }
@@ -2078,9 +2093,63 @@ fn avg_match(grid: i32, count: i32, avg: Option<f64>) -> bool {
     if !avg_count_match(count, avg) {
         return false;
     }
+    if !can_compose_grid_total(count, grid) {
+        return false;
+    }
     let target = (avg * 100.0 + 1e-7).floor() as i32;
     let got = (grid as f64 * 100.0 / count as f64 + 1e-7).floor() as i32;
     got == target
+}
+
+fn avg_can_map_to_composable_grid(count: i32, avg: f64) -> bool {
+    if count <= 0 || !avg.is_finite() || avg <= 0.0 {
+        return false;
+    }
+    let target = (avg * 100.0 + 1e-7).floor() as i32;
+    let max_grid = 18 * count;
+    let reachable = grid_reachability(count, max_grid);
+    (count..=max_grid).any(|grid| {
+        reachable.get(grid as usize).copied().unwrap_or(false)
+            && (grid as f64 * 100.0 / count as f64 + 1e-7).floor() as i32 == target
+    })
+}
+
+fn can_compose_grid_total(count: i32, grid: i32) -> bool {
+    if count == 0 {
+        return grid == 0;
+    }
+    if count < 0 || grid < count || grid > 18 * count {
+        return false;
+    }
+    grid_reachability(count, grid)
+        .get(grid as usize)
+        .copied()
+        .unwrap_or(false)
+}
+
+fn grid_reachability(count: i32, max_grid: i32) -> Vec<bool> {
+    if count < 0 || max_grid < 0 {
+        return vec![];
+    }
+    let max_grid = max_grid as usize;
+    let mut current = vec![false; max_grid + 1];
+    current[0] = true;
+    for _ in 0..count {
+        let mut next = vec![false; max_grid + 1];
+        for grid in 0..=max_grid {
+            if !current[grid] {
+                continue;
+            }
+            for item_grid in VALID_ITEM_GRID_SIZES {
+                let new_grid = grid + *item_grid as usize;
+                if new_grid <= max_grid {
+                    next[new_grid] = true;
+                }
+            }
+        }
+        current = next;
+    }
+    current
 }
 
 fn avg_count_match(count: i32, avg: f64) -> bool {

@@ -182,6 +182,39 @@ fn embedded_data_case_2601_hidden_auction_total_63() -> Result<()> {
 }
 
 #[test]
+fn grid_constraints_reject_impossible_item_sizes_from_4_12_3() -> Result<()> {
+    let mut core = load_embedded_core()?;
+    let base = CalcParams {
+        tier: "101".to_string(),
+        map_nest_id: "2001".to_string(),
+        total_count: 1,
+        blue_count: Some(1),
+        safety_factor: 0.85,
+        max_show: 1,
+        ..Default::default()
+    };
+
+    let exact_impossible = CalcParams {
+        blue_grid: Some(7.0),
+        ..base.clone()
+    };
+    assert!(core.run(exact_impossible)?.is_empty());
+
+    let avg_impossible = CalcParams {
+        blue_avg: Some(7.0),
+        ..base.clone()
+    };
+    assert!(core.run(avg_impossible)?.is_empty());
+
+    let exact_possible = CalcParams {
+        blue_grid: Some(6.0),
+        ..base
+    };
+    assert_eq!(core.run(exact_possible)?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn generated_reference_cases_4_12_2() -> Result<()> {
     let data = Path::new("../decompiled_4_12_2/MapBidCalculator.calculator_data_merged.csv");
     let static_data = Path::new("../core_algorithm/static_data.json");

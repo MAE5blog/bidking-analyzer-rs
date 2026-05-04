@@ -9,6 +9,12 @@
 !/data/auctionanalyzer-4.12.2/static_data.json
 /data/auctionanalyzer-4.12.2/resources/*
 !/data/auctionanalyzer-4.12.2/resources/MapBidCalculator.calculator_data_merged.csv
+!/data/auctionanalyzer-4.12.3/
+/data/auctionanalyzer-4.12.3/*
+!/data/auctionanalyzer-4.12.3/resources/
+!/data/auctionanalyzer-4.12.3/static_data.json
+/data/auctionanalyzer-4.12.3/resources/*
+!/data/auctionanalyzer-4.12.3/resources/MapBidCalculator.calculator_data_merged.csv
 
 /models/ppocrv4/*.onnx
 /models/ppocrv4/*.dll

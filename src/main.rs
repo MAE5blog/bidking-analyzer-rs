@@ -29,7 +29,7 @@ struct CalcArgs {
     data_dir: Option<PathBuf>,
     #[arg(
         long,
-        default_value = "../decompiled_4_12_2/MapBidCalculator.calculator_data_merged.csv"
+        default_value = "../decompiled_4_12_3/MapBidCalculator.calculator_data_merged.csv"
     )]
     data: PathBuf,
     #[arg(long, default_value = "../core_algorithm/static_data.json")]

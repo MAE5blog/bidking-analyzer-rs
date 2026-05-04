@@ -14,7 +14,7 @@
   - `Alt+E` 重置条件
 - 视觉扫描：直接截取主屏幕信息区域，并使用 PP-OCRv4 ONNX 识别
 - 计算后自动回填唯一件数 / 格数
-- 内置 4.12.2 数据，可直接构建运行
+- 内置 4.12.3 数据，可直接构建运行
 
 ## 构建 GUI
 
@@ -72,10 +72,12 @@ cargo run --features dev-cli --bin bidking-dev -- ocr-screen --fallback-total 63
 
 ## 数据与模型
 
-- `data/auctionanalyzer-4.12.2/static_data.json`
-- `data/auctionanalyzer-4.12.2/resources/MapBidCalculator.calculator_data_merged.csv`
+- `data/auctionanalyzer-4.12.3/static_data.json`
+- `data/auctionanalyzer-4.12.3/resources/MapBidCalculator.calculator_data_merged.csv`
 
 这两个文件用于内置估价数据。
+
+4.12.3 的资源 CSV 与 4.12.2 完全一致；本项目同步了 4.12.3 新增的真实物品格数组合校验。
 
 OCR 运行时文件放在 `models/ppocrv4`。为了保持 Git 仓库轻量，ONNX 模型和 ONNX Runtime DLL 不直接提交到仓库；需要视觉扫描时，按 `models/ppocrv4/README.md` 准备这些文件。
 
@@ -87,7 +89,7 @@ PaddleOCR / RapidOCR 模型遵循 Apache-2.0，ONNX Runtime 遵循 MIT。
 cargo test
 ```
 
-当前测试覆盖参考估价用例、4.12.2 生成用例、OCR 文本归一化和屏幕裁剪比例。
+当前测试覆盖参考估价用例、4.12.2/4.12.3 兼容用例、真实物品格数组合校验、OCR 文本归一化和屏幕裁剪比例。
 
 ## License
 
