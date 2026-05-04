@@ -1,0 +1,124 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          # rapidocr_onnxruntime 1.4.x supports Python < 3.13.
+          python-version: "3.12"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build GUI
+        run: cargo build --release --bin bidking-analyzer
+
+      - name: Prepare OCR runtime assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          python -m pip install --target .\_ocr_runtime rapidocr_onnxruntime==1.4.4 onnxruntime==1.25.0
+
+          $modelSource = Join-Path $PWD "_ocr_runtime\rapidocr_onnxruntime\models"
+          $ortSource = Join-Path $PWD "_ocr_runtime\onnxruntime\capi"
+          $modelDest = Join-Path $PWD "dist\bidking-analyzer\models\ppocrv4"
+          New-Item -ItemType Directory -Force -Path $modelDest | Out-Null
+
+          Copy-Item -LiteralPath (Join-Path $modelSource "ch_PP-OCRv4_det_infer.onnx") -Destination $modelDest -Force
+          Copy-Item -LiteralPath (Join-Path $modelSource "ch_PP-OCRv4_rec_infer.onnx") -Destination $modelDest -Force
+          Copy-Item -LiteralPath (Join-Path $modelSource "ch_ppocr_mobile_v2.0_cls_infer.onnx") -Destination $modelDest -Force
+          Copy-Item -LiteralPath (Join-Path $ortSource "onnxruntime.dll") -Destination $modelDest -Force
+          if (Test-Path -LiteralPath (Join-Path $ortSource "onnxruntime_providers_shared.dll")) {
+            Copy-Item -LiteralPath (Join-Path $ortSource "onnxruntime_providers_shared.dll") -Destination $modelDest -Force
+          }
+          Copy-Item -LiteralPath ".\models\ppocrv4\README.md" -Destination $modelDest -Force
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $PWD "dist\bidking-analyzer"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item -LiteralPath ".\target\release\bidking-analyzer.exe" -Destination (Join-Path $root "bidking-analyzer.exe") -Force
+          @(
+            "BidKing Analyzer RS"
+            ""
+            "运行 bidking-analyzer.exe 即可启动估价器。"
+            ""
+            "快捷键："
+            "- Alt+Q 开始计算"
+            "- Alt+W 视觉扫描"
+            "- Alt+E 重置条件"
+            ""
+            "OCR 模型和 ONNX Runtime 已随包放在 models\ppocrv4。"
+          ) | Set-Content -LiteralPath (Join-Path $root "README.txt") -Encoding UTF8
+
+          $zip = Join-Path $PWD "dist\bidking-analyzer-windows-x64.zip"
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+          Compress-Archive -LiteralPath $root -DestinationPath $zip -Force
+          Get-ChildItem -Recurse -File $root | Select-Object FullName,Length | Format-Table -AutoSize
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bidking-analyzer-windows-x64
+          path: dist/bidking-analyzer-windows-x64.zip
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $tag = "${{ inputs.tag }}"
+          }
+          $asset = "dist\bidking-analyzer-windows-x64.zip"
+          $title = "BidKing Analyzer RS $tag"
+          $notesFile = Join-Path $PWD "dist\release-notes.md"
+          @(
+            "Windows x64 开箱即用包。"
+            ""
+            "解压后运行 bidking-analyzer.exe。"
+            "包内已包含 PP-OCRv4 ONNX 模型和 ONNX Runtime DLL，用于 Alt+W 视觉扫描。"
+          ) | Set-Content -LiteralPath $notesFile -Encoding UTF8
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --title $title --notes-file $notesFile --target "${{ github.sha }}"
+          }
