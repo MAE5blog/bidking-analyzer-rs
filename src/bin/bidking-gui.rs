@@ -7,9 +7,14 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+const MAX_VISIBLE_COMBOS: usize = 10;
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1216.0, 800.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("竞拍之王估价器")
+            .with_inner_size([1220.0, 800.0])
+            .with_min_inner_size([1080.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -163,7 +168,7 @@ impl Default for BidKingGui {
             avg_grid_all: String::new(),
             total_grid: String::new(),
             safety: "0.85".to_string(),
-            display_count: "100".to_string(),
+            display_count: MAX_VISIBLE_COMBOS.to_string(),
             gw_count: String::new(),
             gw_min: String::new(),
             gw_grid: String::new(),
@@ -206,6 +211,8 @@ impl Default for BidKingGui {
 
 impl eframe::App for BidKingGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.normalize_display_count();
+
         let mut global_actions = Vec::new();
         if let Some(hotkeys) = &self.global_hotkeys {
             while let Ok(action) = hotkeys.rx.try_recv() {
@@ -238,15 +245,17 @@ impl eframe::App for BidKingGui {
 
         egui::SidePanel::left("left_panel")
             .resizable(false)
-            .exact_width(424.0)
+            .exact_width(432.0)
             .frame(
                 egui::Frame::default()
                     .fill(color_bg())
-                    .inner_margin(egui::Margin::symmetric(10, 0)),
+                    .inner_margin(egui::Margin::symmetric(12, 0)),
             )
             .show(ctx, |ui| {
+                let action_area_height = 56.0;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .max_height((ui.available_height() - action_area_height).max(420.0))
                     .show(ui, |ui| {
                         ui.add_space(10.0);
                         self.map_section(ui);
@@ -254,17 +263,16 @@ impl eframe::App for BidKingGui {
                         self.color_constraints_section(ui);
                         ui.add_space(8.0);
                         self.revealed_section(ui);
-                        ui.add_space(10.0);
-                        self.action_buttons(ui, ctx);
-                        ui.add_space(10.0);
                     });
+                ui.add_space(9.0);
+                self.action_buttons(ui, ctx);
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
                     .fill(color_bg())
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
+                    .inner_margin(egui::Margin::symmetric(16, 0)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -385,7 +393,7 @@ impl BidKingGui {
                     &mut self.safety,
                     174.0,
                 );
-                labeled_text(&mut cols[1], "展示组合数", &mut self.display_count, 174.0);
+                readout_text(&mut cols[1], "展示组合数", "固定前 10 个", 174.0);
             });
         });
     }
@@ -489,13 +497,41 @@ impl BidKingGui {
 
     fn action_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            if action_button(ui, "开始计算", "Alt+Q", color_gold(), color_bg()).clicked() {
+            ui.spacing_mut().item_spacing.x = 7.0;
+            let button_width = ((ui.available_width() - 21.0) / 4.0).clamp(82.0, 102.0);
+            if action_button(
+                ui,
+                "开始计算",
+                "Alt+Q",
+                button_width,
+                color_gold(),
+                color_bg(),
+            )
+            .clicked()
+            {
                 self.calculate();
             }
-            if action_button(ui, "视觉扫描", "Alt+W", color_purple(), color_text()).clicked() {
+            if action_button(
+                ui,
+                "视觉扫描",
+                "Alt+W",
+                button_width,
+                color_purple(),
+                color_text(),
+            )
+            .clicked()
+            {
                 self.scan_screen();
             }
-            if action_button(ui, "重置条件", "Alt+E", color_panel_alt(), color_text()).clicked()
+            if action_button(
+                ui,
+                "重置条件",
+                "Alt+E",
+                button_width,
+                color_panel_alt(),
+                color_text(),
+            )
+            .clicked()
             {
                 self.reset_conditions();
             }
@@ -510,7 +546,7 @@ impl BidKingGui {
                         .strong()
                         .color(color_text()),
                     )
-                    .min_size(egui::vec2(94.0, 36.0))
+                    .min_size(egui::vec2(button_width, 42.0))
                     .fill(if self.window_topmost {
                         color_green_dark()
                     } else {
@@ -580,18 +616,19 @@ impl BidKingGui {
         ui.add_space(12.0);
 
         section(ui, "出价参考", |ui| {
-            ui.horizontal(|ui| {
-                price_card(ui, "保守出价 (P25)", output.p25, color_green());
-                price_card(ui, "均衡出价 (P50)", output.p50, color_orange());
-                price_card(ui, "激进出价 (P75)", output.p75, color_red());
+            ui.columns(3, |cols| {
+                price_card(&mut cols[0], "保守出价 (P25)", output.p25, color_green());
+                price_card(&mut cols[1], "均衡出价 (P50)", output.p50, color_orange());
+                price_card(&mut cols[2], "激进出价 (P75)", output.p75, color_red());
             });
         });
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("可行组合列表").color(color_text()));
-            ui.add_space(250.0);
-            ui.label(egui::RichText::new("回填唯一件数/格数").color(color_gold()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                pill_label(ui, "自动回填唯一件数/格数", color_gold());
+            });
         });
         result_table(ui, &output.rows);
         ui.add_space(12.0);
@@ -795,15 +832,17 @@ impl BidKingGui {
             .get(&self.selected_map_id)
             .cloned()
             .with_context(|| format!("未知地图 {}", self.selected_map_id))?;
-        let display_count = parse_optional_usize(&self.display_count)?
-            .unwrap_or(100)
-            .max(1);
+        let display_count = MAX_VISIBLE_COMBOS;
+        let total_count = parse_i32(&self.total, "总件数")?;
+        if total_count <= 0 {
+            anyhow::bail!("请先填写大于 0 的总件数");
+        }
         let revealed_count = parse_optional_i32(&self.revealed_count)?;
         let revealed_total_value = self.parse_revealed_total(revealed_count)?;
         let cp = CalcParams {
             tier: self.tier.trim().to_string(),
             map_nest_id: nest_id,
-            total_count: parse_i32(&self.total, "总件数")?,
+            total_count,
             total_grid_target: parse_optional_f64(&self.total_grid)?,
             avg_grid_all: parse_optional_f64(&self.avg_grid_all)?,
             high_quality_count: parse_optional_i32(&self.high_quality_count)?,
@@ -890,6 +929,13 @@ impl BidKingGui {
         Ok(Some(count as f64 * avg))
     }
 
+    fn normalize_display_count(&mut self) {
+        let expected = MAX_VISIBLE_COMBOS.to_string();
+        if self.display_count.trim() != expected {
+            self.display_count = expected;
+        }
+    }
+
     fn reset_conditions(&mut self) {
         let maps = self.maps.clone();
         let global_hotkeys = self.global_hotkeys.take();
@@ -926,12 +972,14 @@ impl BidKingGui {
 }
 
 fn section<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let outer_width = ui.available_width();
     egui::Frame::default()
         .fill(color_panel())
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(13, 9))
         .show(ui, |ui| {
+            ui.set_min_width((outer_width - 28.0).max(120.0));
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
                 ui.painter()
@@ -957,6 +1005,21 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
     field_label(ui, label);
     text_input(ui, value, width);
+}
+
+fn readout_text(ui: &mut egui::Ui, label: &str, value: &str, width: f32) {
+    field_label(ui, label);
+    egui::Frame::default()
+        .fill(color_card())
+        .stroke(egui::Stroke::new(1.0, color_border()))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.add_sized(
+                [(width - 12.0).max(20.0), 20.0],
+                egui::Label::new(egui::RichText::new(value).strong().color(color_gold())),
+            );
+        });
 }
 
 fn table_header(ui: &mut egui::Ui, label: &str, width: f32) {
@@ -1011,6 +1074,7 @@ fn action_button(
     ui: &mut egui::Ui,
     label: &str,
     shortcut: &str,
+    width: f32,
     fill: egui::Color32,
     text_color: egui::Color32,
 ) -> egui::Response {
@@ -1020,11 +1084,22 @@ fn action_button(
                 .strong()
                 .color(text_color),
         )
-        .min_size(egui::vec2(94.0, 36.0))
+        .min_size(egui::vec2(width, 42.0))
         .fill(fill)
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6),
     )
+}
+
+fn pill_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) {
+    egui::Frame::default()
+        .fill(color_card())
+        .stroke(egui::Stroke::new(1.0, accent))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).strong().size(12.0).color(accent));
+        });
 }
 
 fn status_bar(ui: &mut egui::Ui, text: &str) {
@@ -1077,8 +1152,22 @@ fn force_dark_visuals(ui: &mut egui::Ui) {
 }
 
 fn empty_results(ui: &mut egui::Ui) {
-    section(ui, "等待计算", |ui| {
-        ui.label(egui::RichText::new("填写左侧参数后点击开始计算。").color(color_muted()));
+    section(ui, "出价参考", |ui| {
+        ui.columns(3, |cols| {
+            price_placeholder(&mut cols[0], "保守出价 (P25)", color_green());
+            price_placeholder(&mut cols[1], "均衡出价 (P50)", color_orange());
+            price_placeholder(&mut cols[2], "激进出价 (P75)", color_red());
+        });
+    });
+    ui.add_space(12.0);
+
+    section(ui, "可行组合列表", |ui| {
+        empty_table(ui);
+    });
+    ui.add_space(12.0);
+
+    section(ui, "物品级可能组成（价格/占格拟合）", |ui| {
+        ui.label(egui::RichText::new("暂无结果").color(color_muted()));
     });
 }
 
@@ -1105,18 +1194,20 @@ fn high_range_row(ui: &mut egui::Ui, output: &CalculationOutput) {
         .corner_radius(5)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
+            ui.columns(4, |cols| {
+                cols[0].label(
                     egui::RichText::new("品质件数可能性")
                         .strong()
                         .color(color_gold()),
                 );
-                ui.add_space(80.0);
-                range_label(ui, "紫件(Q4)", output.purple_range, color_purple());
-                ui.add_space(90.0);
-                range_label(ui, "金件(Q5)", output.gold_range, color_gold());
-                ui.add_space(90.0);
-                range_label(ui, "红件(Q6)", output.red_range, color_red());
+                range_label(
+                    &mut cols[1],
+                    "紫件(Q4)",
+                    output.purple_range,
+                    color_purple(),
+                );
+                range_label(&mut cols[2], "金件(Q5)", output.gold_range, color_gold());
+                range_label(&mut cols[3], "红件(Q6)", output.red_range, color_red());
             });
         });
 }
@@ -1134,11 +1225,11 @@ fn range_label(ui: &mut egui::Ui, label: &str, range: Option<CountRange>, color:
 fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32) {
     egui::Frame::default()
         .fill(color_card())
-        .stroke(egui::Stroke::new(1.0, accent))
+        .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(22, 13))
+        .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
-            ui.set_width(210.0);
+            ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new(label).color(color_muted()).size(12.0));
                 ui.label(
@@ -1147,21 +1238,53 @@ fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32)
                         .strong()
                         .color(accent),
                 );
-                ui.separator();
+                accent_bar(ui, accent);
             });
         });
 }
 
+fn price_placeholder(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
+    egui::Frame::default()
+        .fill(color_card())
+        .stroke(egui::Stroke::new(1.0, color_border()))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(label).color(color_muted()).size(12.0));
+                ui.label(
+                    egui::RichText::new("--")
+                        .size(28.0)
+                        .strong()
+                        .color(color_muted()),
+                );
+                accent_bar(ui, accent);
+            });
+        });
+}
+
+fn accent_bar(ui: &mut egui::Ui, accent: egui::Color32) {
+    ui.add_space(6.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(2), accent);
+}
+
 fn result_table(ui: &mut egui::Ui, rows: &[UiCombo]) {
+    let outer_width = ui.available_width();
     egui::Frame::default()
         .fill(color_panel())
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
+            ui.set_min_width((outer_width - 22.0).max(560.0));
+            let col_width = (ui.available_width() / 8.0).max(64.0);
             egui::Grid::new("result_grid")
                 .striped(true)
-                .min_col_width(64.0)
+                .min_col_width(col_width)
                 .num_columns(8)
                 .show(ui, |ui| {
                     table_head(ui, "绿白", color_gold());
@@ -1191,6 +1314,40 @@ fn result_table(ui: &mut egui::Ui, rows: &[UiCombo]) {
                             egui::RichText::new(format!("{:.1}", row.total_grid))
                                 .color(color_text()),
                         );
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn empty_table(ui: &mut egui::Ui) {
+    let outer_width = ui.available_width();
+    egui::Frame::default()
+        .fill(color_panel())
+        .stroke(egui::Stroke::new(1.0, color_border()))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width((outer_width - 22.0).max(560.0));
+            let col_width = (ui.available_width() / 8.0).max(64.0);
+            egui::Grid::new("empty_result_grid")
+                .striped(true)
+                .min_col_width(col_width)
+                .num_columns(8)
+                .show(ui, |ui| {
+                    table_head(ui, "绿白", color_gold());
+                    table_head(ui, "蓝", color_gold());
+                    table_head(ui, "紫", color_gold());
+                    table_head(ui, "金", color_gold());
+                    table_head(ui, "红", color_gold());
+                    table_head(ui, "概率", color_gold());
+                    table_head(ui, "组合估值", color_gold());
+                    table_head(ui, "预计总格", color_gold());
+                    ui.end_row();
+                    for _ in 0..4 {
+                        for _ in 0..8 {
+                            ui.label(egui::RichText::new("--").color(color_muted()));
+                        }
                         ui.end_row();
                     }
                 });
@@ -1282,14 +1439,6 @@ fn tier_label(tier: &str) -> String {
 }
 
 fn parse_optional_i32(text: &str) -> Result<Option<i32>> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(text.parse()?))
-}
-
-fn parse_optional_usize(text: &str) -> Result<Option<usize>> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
