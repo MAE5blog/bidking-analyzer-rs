@@ -811,6 +811,43 @@ impl BidKingGui {
         updated += set_if_some(&mut self.manual_gold_item, &result.gold_avg_value);
         updated += set_if_some(&mut self.min_value_floor, &result.min_value_floor);
         updated += self.merge_ocr_value_samples(&result.value_samples);
+        updated += self.reconcile_grids_from_averages(result);
+        updated
+    }
+
+    fn reconcile_grids_from_averages(&mut self, result: &ocr::OcrResult) -> usize {
+        let mut updated = 0;
+        let count = self.gw_count.clone();
+        let avg = self.gw_avg.clone();
+        updated += set_grid_from_average(&mut self.gw_grid, &count, &avg, result.wg_grid.is_some());
+        let count = self.blue_count.clone();
+        let avg = self.blue_avg.clone();
+        updated += set_grid_from_average(
+            &mut self.blue_grid,
+            &count,
+            &avg,
+            result.blue_grid.is_some(),
+        );
+        let count = self.purple_count.clone();
+        let avg = self.purple_avg.clone();
+        updated += set_grid_from_average(
+            &mut self.purple_grid,
+            &count,
+            &avg,
+            result.purple_grid.is_some(),
+        );
+        let count = self.gold_count.clone();
+        let avg = self.gold_avg.clone();
+        updated += set_grid_from_average(
+            &mut self.gold_grid,
+            &count,
+            &avg,
+            result.gold_grid.is_some(),
+        );
+        let count = self.red_count.clone();
+        let avg = self.red_avg.clone();
+        updated +=
+            set_grid_from_average(&mut self.red_grid, &count, &avg, result.red_grid.is_some());
         updated
     }
 
@@ -820,40 +857,29 @@ impl BidKingGui {
             &mut self.gw_count,
             unique_i32(results, |r| r.greenwhite_count),
         );
-        summary.fields += set_unique_grid(
-            &mut self.gw_grid,
-            unique_i32(results, |r| r.greenwhite_count),
-            unique_grid(results, |r| r.greenwhite_grid_est),
-        );
+        summary.fields +=
+            set_grid_from_average(&mut self.gw_grid, &self.gw_count, &self.gw_avg, false);
         summary.fields +=
             set_unique_i32(&mut self.blue_count, unique_i32(results, |r| r.blue_count));
-        summary.fields += set_unique_grid(
-            &mut self.blue_grid,
-            unique_i32(results, |r| r.blue_count),
-            unique_grid(results, |r| r.blue_grid_est),
-        );
+        summary.fields +=
+            set_grid_from_average(&mut self.blue_grid, &self.blue_count, &self.blue_avg, false);
         summary.fields += set_unique_i32(
             &mut self.purple_count,
             unique_i32(results, |r| r.purple_count),
         );
-        summary.fields += set_unique_grid(
+        summary.fields += set_grid_from_average(
             &mut self.purple_grid,
-            unique_i32(results, |r| r.purple_count),
-            unique_grid(results, |r| r.purple_grid_est),
+            &self.purple_count,
+            &self.purple_avg,
+            false,
         );
         summary.fields +=
             set_unique_i32(&mut self.gold_count, unique_i32(results, |r| r.gold_count));
-        summary.fields += set_unique_grid(
-            &mut self.gold_grid,
-            unique_i32(results, |r| r.gold_count),
-            unique_grid(results, |r| r.gold_grid_est),
-        );
+        summary.fields +=
+            set_grid_from_average(&mut self.gold_grid, &self.gold_count, &self.gold_avg, false);
         summary.fields += set_unique_i32(&mut self.red_count, unique_i32(results, |r| r.red_count));
-        summary.fields += set_unique_grid(
-            &mut self.red_grid,
-            unique_i32(results, |r| r.red_count),
-            unique_grid(results, |r| r.red_grid_est),
-        );
+        summary.fields +=
+            set_grid_from_average(&mut self.red_grid, &self.red_count, &self.red_avg, false);
         summary
     }
 
@@ -1564,11 +1590,31 @@ fn set_unique_i32(target: &mut String, value: Option<i32>) -> usize {
     1
 }
 
-fn set_unique_grid(target: &mut String, count: Option<i32>, value: Option<i32>) -> usize {
-    if count.unwrap_or_default() <= 0 {
+fn set_grid_from_average(
+    target: &mut String,
+    count_text: &str,
+    avg_text: &str,
+    direct_grid_seen: bool,
+) -> usize {
+    if direct_grid_seen {
         return 0;
     }
-    set_unique_i32(target, value)
+    let count = parse_optional_i32(count_text).ok().flatten();
+    let avg = parse_optional_f64(avg_text).ok().flatten();
+    set_unique_i32(target, infer_grid_from_average(count, avg))
+}
+
+fn infer_grid_from_average(count: Option<i32>, avg: Option<f64>) -> Option<i32> {
+    let count = count?;
+    let avg = avg?;
+    if count <= 0 || !avg.is_finite() || avg <= 0.0 {
+        return None;
+    }
+    let target = (avg * 100.0 + 1e-7).floor() as i32;
+    let mut matches = (count..=18 * count)
+        .filter(|grid| ((*grid as f64 * 100.0 / count as f64) + 1e-7).floor() as i32 == target);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 fn unique_i32(
@@ -1579,27 +1625,6 @@ fn unique_i32(
     let first = f(iter.next()?);
     if iter.all(|result| f(result) == first) {
         Some(first)
-    } else {
-        None
-    }
-}
-
-fn unique_grid(
-    results: &[bidking_rs::ComboResult],
-    f: impl Fn(&bidking_rs::ComboResult) -> f64,
-) -> Option<i32> {
-    let mut iter = results.iter();
-    let first = round_grid(f(iter.next()?))?;
-    if iter.all(|result| round_grid(f(result)) == Some(first)) {
-        Some(first)
-    } else {
-        None
-    }
-}
-
-fn round_grid(value: f64) -> Option<i32> {
-    if value.is_finite() {
-        Some(value.round() as i32)
     } else {
         None
     }
