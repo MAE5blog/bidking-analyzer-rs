@@ -758,15 +758,32 @@ impl BidKingGui {
                 } else {
                     format!("；{}", scan.parsed.warnings.join("；"))
                 };
-                self.status = format!(
-                    "视觉扫描完成：{}，填入 {} 个字段，{} 行 {}{}。",
+                let scan_status = format!(
+                    "视觉扫描完成：{}，填入 {} 个字段，{} 行 {}{}",
                     map,
                     updated,
                     scan.engine,
                     scan.lines.len(),
                     warnings
                 );
-                self.output = None;
+                match self.calculate_inner() {
+                    Ok((output, auto_fill)) => {
+                        let auto_fill_status = if auto_fill.fields > 0 {
+                            format!("；计算后回填 {} 个唯一件数/格数字段", auto_fill.fields)
+                        } else {
+                            String::new()
+                        };
+                        self.status = format!(
+                            "{}。已自动计算出价：当前地图: {}{}。",
+                            scan_status, output.map_label, auto_fill_status
+                        );
+                        self.output = Some(output);
+                    }
+                    Err(err) => {
+                        self.status = format!("{scan_status}。自动计算失败: {err:#}");
+                        self.output = None;
+                    }
+                }
             }
             Err(err) => {
                 self.status = format!("视觉扫描失败: {err:#}");
