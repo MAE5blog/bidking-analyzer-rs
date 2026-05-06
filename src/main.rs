@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 
-use bidking_rs::{CalcParams, StaticData, importer, load_core, ocr};
+use bidking_rs::{CalcParams, StaticData, importer, load_core, ocr, recommended_bid_value};
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Debug, Parser)]
 #[command(name = "bidking")]
@@ -15,11 +16,13 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Calc(CalcArgs),
     ImportExe(ImportExeArgs),
     ListMaps(DataArgs),
     OcrImage(OcrImageArgs),
+    OcrBench(OcrBenchArgs),
     OcrScreen(OcrScreenArgs),
 }
 
@@ -118,6 +121,16 @@ struct OcrScreenArgs {
     fallback_total: Option<i32>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct OcrBenchArgs {
+    #[arg(long, required = true)]
+    image: Vec<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    #[arg(long)]
+    fallback_total: Option<i32>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -125,6 +138,7 @@ fn main() -> Result<()> {
         Some(Command::ImportExe(args)) => run_import_exe(args),
         Some(Command::ListMaps(args)) => run_list_maps(args),
         Some(Command::OcrImage(args)) => run_ocr_image(args),
+        Some(Command::OcrBench(args)) => run_ocr_bench(args),
         Some(Command::OcrScreen(args)) => run_ocr_screen(args),
         None => run_calc(cli.calc),
     }
@@ -191,14 +205,87 @@ fn run_ocr_screen(args: OcrScreenArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_ocr_bench(args: OcrBenchArgs) -> Result<()> {
+    if args.image.is_empty() {
+        anyhow::bail!("至少传入一张 --image");
+    }
+    let repeat = args.repeat.max(1);
+    let warmup_start = Instant::now();
+    ocr::warm_up_ppocrv4_onnx()?;
+    println!("warmup_ms={}", warmup_start.elapsed().as_millis());
+    println!(
+        "image,run,source_ms,preprocess_ms,crop_save_ms,ocr_ms,parse_ms,total_ms,lines,map,total,min_floor"
+    );
+    let mut totals = Vec::new();
+    let mut source = Vec::new();
+    let mut preprocess = Vec::new();
+    let mut ocr_times = Vec::new();
+    let mut parse = Vec::new();
+    for run in 1..=repeat {
+        for image in &args.image {
+            let scan = ocr::scan_screenshot_with_ppocrv4_onnx(image, args.fallback_total)
+                .with_context(|| format!("ocr bench {}", image.display()))?;
+            let timings = scan.timings;
+            totals.push(timings.total_ms);
+            source.push(timings.source_ms);
+            preprocess.push(timings.preprocess_ms + timings.crop_save_ms);
+            ocr_times.push(timings.ocr_ms);
+            parse.push(timings.parse_ms);
+            println!(
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
+                image.display(),
+                run,
+                timings.source_ms,
+                timings.preprocess_ms,
+                timings.crop_save_ms,
+                timings.ocr_ms,
+                timings.parse_ms,
+                timings.total_ms,
+                scan.lines.len(),
+                scan.parsed.map_name.as_deref().unwrap_or(""),
+                scan.parsed.total_all.as_deref().unwrap_or(""),
+                scan.parsed.min_value_floor.as_deref().unwrap_or("")
+            );
+        }
+    }
+    print_bench_summary("source_ms", &source);
+    print_bench_summary("preprocess_ms", &preprocess);
+    print_bench_summary("ocr_ms", &ocr_times);
+    print_bench_summary("parse_ms", &parse);
+    print_bench_summary("total_ms", &totals);
+    Ok(())
+}
+
+fn print_bench_summary(label: &str, values: &[u128]) {
+    if values.is_empty() {
+        return;
+    }
+    let min = values.iter().copied().min().unwrap_or_default();
+    let max = values.iter().copied().max().unwrap_or_default();
+    let sum = values.iter().sum::<u128>();
+    let avg = sum as f64 / values.len() as f64;
+    println!("summary_{label}=min:{min} avg:{avg:.1} max:{max}");
+}
+
 fn print_ocr_scan(scan: ocr::OcrScan) {
     println!("engine={}", scan.engine);
-    println!("crop={}", scan.crop_path.display());
+    if scan.crop_path.as_os_str().is_empty() {
+        println!("crop=not_saved");
+    } else {
+        println!("crop={}", scan.crop_path.display());
+    }
+    println!("timing_source_ms={}", scan.timings.source_ms);
+    println!("timing_preprocess_ms={}", scan.timings.preprocess_ms);
+    println!("timing_crop_save_ms={}", scan.timings.crop_save_ms);
+    println!("timing_ocr_ms={}", scan.timings.ocr_ms);
+    println!("timing_parse_ms={}", scan.timings.parse_ms);
+    println!("timing_total_ms={}", scan.timings.total_ms);
     println!("lines={}", scan.lines.len());
     for line in &scan.lines {
         println!("line={line}");
     }
     println!("parsed:");
+    print_field("round_number", scan.parsed.round_number.as_deref());
     print_field("map_name", scan.parsed.map_name.as_deref());
     print_field("total_all", scan.parsed.total_all.as_deref());
     print_field(
@@ -291,8 +378,10 @@ fn run_calc(args: CalcArgs) -> Result<()> {
         min_value_floor: args.min_value_floor,
         ..Default::default()
     };
+    let calc_start = Instant::now();
     let results = core.run(cp.clone())?;
-    let (p25, p50, p75) = core.price_range(&results, &cp);
+    let calc_ms = calc_start.elapsed().as_millis();
+    let (p25, p50, p75) = core.price_range_for_last_run(&cp);
     let tier_weights = core.tier_weights(&cp.tier)?;
     let probs = core
         .loader
@@ -312,11 +401,12 @@ fn run_calc(args: CalcArgs) -> Result<()> {
         probs.source
     );
     println!("combos={} raw={}", results.len(), core.raw_results.len());
+    println!("calc_ms={calc_ms}");
     println!(
         "bid_p25={:.0} bid_p50={:.0} bid_p75={:.0}",
-        p25 * cp.safety_factor,
-        p50 * cp.safety_factor,
-        p75 * cp.safety_factor
+        recommended_bid_value(p25, &cp),
+        recommended_bid_value(p50, &cp),
+        recommended_bid_value(p75, &cp)
     );
     println!("greenwhite,blue,purple,gold,red,probability,final_value,total_grid_est");
     for r in results.iter().take(cp.max_show) {

@@ -1,21 +1,42 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
-use bidking_rs::{CalcParams, ValueSample, load_embedded_core, load_embedded_static_data, ocr};
+use bidking_rs::{
+    CalcParams, ValueSample, grid_matches_average_for_quality, grid_matches_average_with_sizes,
+    infer_grid_from_average_for_quality, infer_grid_from_average_with_sizes, load_embedded_core,
+    load_embedded_static_data, normalize_calc_params, ocr, recommended_bid_value,
+};
 use eframe::egui;
+use std::env;
 use std::path::Path;
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_VISIBLE_COMBOS: usize = 10;
 const TEXT_STROKE: f32 = 1.12;
+const FULL_WINDOW_SIZE: egui::Vec2 = egui::vec2(1220.0, 800.0);
+const FULL_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(1080.0, 720.0);
+const FULL_WINDOW_MAX_SIZE: egui::Vec2 = egui::vec2(4096.0, 2160.0);
+const MINI_WINDOW_SIZE: egui::Vec2 = egui::vec2(624.0, 700.0);
+const MINI_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(540.0, 420.0);
+const MINI_WINDOW_MAX_SIZE: egui::Vec2 = egui::vec2(624.0, 711.0);
+
+#[derive(Debug, Default)]
+struct MapGridSizes {
+    blue: Vec<i32>,
+    purple: Vec<i32>,
+    gold: Vec<i32>,
+    red: Vec<i32>,
+}
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("竞拍之王估价器")
-            .with_inner_size([1220.0, 800.0])
-            .with_min_inner_size([1080.0, 720.0]),
+            .with_inner_size(FULL_WINDOW_SIZE)
+            .with_min_inner_size(FULL_WINDOW_MIN_SIZE)
+            .with_max_inner_size(FULL_WINDOW_MAX_SIZE),
         ..Default::default()
     };
     eframe::run_native(
@@ -54,6 +75,15 @@ struct AutoFillSummary {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+struct AutoFilledCounts {
+    gw: bool,
+    blue: bool,
+    purple: bool,
+    gold: bool,
+    red: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 struct CountRange {
     min: i32,
     max: i32,
@@ -73,6 +103,17 @@ struct CalculationOutput {
     gold_range: Option<CountRange>,
     red_range: Option<CountRange>,
     composition_lines: Vec<String>,
+    high_quality_only: bool,
+}
+
+impl CalculationOutput {
+    fn scope_warning_suffix(&self) -> &'static str {
+        if self.high_quality_only {
+            "；仅紫金红模式，不包含绿白/蓝色和右侧未识别战利品，不能当全局最终出价"
+        } else {
+            ""
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -119,7 +160,9 @@ struct BidKingGui {
     value_samples: Vec<ValueSampleInput>,
     status: String,
     output: Option<CalculationOutput>,
+    auto_filled_counts: AutoFilledCounts,
     window_topmost: bool,
+    mini_mode: bool,
     global_hotkeys: Option<GlobalHotkeys>,
 }
 
@@ -163,9 +206,9 @@ impl RegisteredHotkeys {
     }
 }
 
-impl Default for BidKingGui {
-    fn default() -> Self {
-        let mut app = Self {
+impl BidKingGui {
+    fn new_form_state() -> Self {
+        Self {
             maps: Vec::new(),
             selected_map_id: "2101".to_string(),
             tier: "101".to_string(),
@@ -203,9 +246,17 @@ impl Default for BidKingGui {
             value_samples: Vec::new(),
             status: String::new(),
             output: None,
+            auto_filled_counts: AutoFilledCounts::default(),
             window_topmost: false,
+            mini_mode: false,
             global_hotkeys: None,
-        };
+        }
+    }
+}
+
+impl Default for BidKingGui {
+    fn default() -> Self {
+        let mut app = Self::new_form_state();
         match app.reload_maps() {
             Ok(()) => {}
             Err(err) => app.status = format!("内置数据加载失败: {err}"),
@@ -248,6 +299,16 @@ impl eframe::App for BidKingGui {
             self.reset_conditions();
         }
 
+        if self.mini_mode {
+            self.mini_ui(ctx);
+        } else {
+            self.full_ui(ctx);
+        }
+    }
+}
+
+impl BidKingGui {
+    fn full_ui(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("left_panel")
             .resizable(false)
             .exact_width(432.0)
@@ -289,12 +350,33 @@ impl eframe::App for BidKingGui {
                     });
             });
     }
+
+    fn mini_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(color_bg())
+                    .inner_margin(egui::Margin::symmetric(8, 0)),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                self.action_buttons(ui, ctx);
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.mini_results_section(ui);
+                        ui.add_space(8.0);
+                    });
+            });
+    }
 }
 
 impl BidKingGui {
     fn with_context(ctx: &egui::Context) -> Self {
         let mut app = Self::default();
         app.install_global_hotkeys(ctx);
+        start_ocr_warmup(ctx);
         app
     }
 
@@ -375,7 +457,7 @@ impl BidKingGui {
                 labeled_text(&mut cols[0], "总件数 (选填)", &mut self.total, 174.0);
                 labeled_text(
                     &mut cols[1],
-                    "紫金币总数 (选填)",
+                    "紫金红总数 (选填)",
                     &mut self.high_quality_count,
                     174.0,
                 );
@@ -533,7 +615,7 @@ impl BidKingGui {
     fn action_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 7.0;
-            let button_width = ((ui.available_width() - 21.0) / 4.0).clamp(82.0, 102.0);
+            let button_width = ((ui.available_width() - 28.0) / 5.0).clamp(64.0, 112.0);
             if action_button(
                 ui,
                 "开始计算",
@@ -600,7 +682,37 @@ impl BidKingGui {
                 };
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
             }
+            if action_button(
+                ui,
+                if self.mini_mode {
+                    "完整版"
+                } else {
+                    "精简版"
+                },
+                "切换",
+                button_width,
+                color_panel_alt(),
+                color_text(),
+            )
+            .clicked()
+            {
+                self.set_mini_mode(ctx, !self.mini_mode);
+            }
         });
+    }
+
+    fn set_mini_mode(&mut self, ctx: &egui::Context, mini_mode: bool) {
+        self.mini_mode = mini_mode;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        if mini_mode {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MINI_WINDOW_MIN_SIZE));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(MINI_WINDOW_MAX_SIZE));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(MINI_WINDOW_SIZE));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(FULL_WINDOW_MAX_SIZE));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(FULL_WINDOW_MIN_SIZE));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(FULL_WINDOW_SIZE));
+        }
     }
 
     fn results_section(&mut self, ui: &mut egui::Ui) {
@@ -631,10 +743,26 @@ impl BidKingGui {
 
         summary_row(
             ui,
-            "总件数:",
-            &format_number(parse_i32_or_zero(&self.total) as i64),
-            "（全品类）",
-            color_green(),
+            if output.high_quality_only {
+                "紫金红总数:"
+            } else {
+                "总件数:"
+            },
+            &if output.high_quality_only {
+                format_number(parse_i32_or_zero(&self.high_quality_count) as i64)
+            } else {
+                format_number(parse_i32_or_zero(&self.total) as i64)
+            },
+            if output.high_quality_only {
+                "（仅紫金红，不含绿白/蓝）"
+            } else {
+                "（全品类）"
+            },
+            if output.high_quality_only {
+                color_orange()
+            } else {
+                color_green()
+            },
         );
         summary_row(
             ui,
@@ -697,6 +825,51 @@ impl BidKingGui {
         );
     }
 
+    fn mini_results_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("计算结果")
+                    .size(22.0)
+                    .color(color_gold())
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("概率拟合 / 出价参考 / 组合反推")
+                    .size(13.0)
+                    .color(color_muted()),
+            );
+        });
+        ui.add_space(8.0);
+        if !self.status.trim().is_empty() {
+            status_bar(ui, &self.status);
+            ui.add_space(10.0);
+        }
+
+        section(ui, "出价参考", |ui| {
+            ui.columns(3, |cols| {
+                if let Some(output) = &self.output {
+                    price_card(&mut cols[0], "保守出价 (P25)", output.p25, color_green());
+                    price_card(&mut cols[1], "均衡出价 (P50)", output.p50, color_orange());
+                    price_card(&mut cols[2], "激进出价 (P75)", output.p75, color_red());
+                } else {
+                    price_placeholder(&mut cols[0], "保守出价 (P25)", color_green());
+                    price_placeholder(&mut cols[1], "均衡出价 (P50)", color_orange());
+                    price_placeholder(&mut cols[2], "激进出价 (P75)", color_red());
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        section(ui, "可行组合列表", |ui| {
+            if let Some(output) = &self.output {
+                result_table(ui, &output.rows);
+            } else {
+                empty_table(ui);
+            }
+        });
+    }
+
     fn reload_maps(&mut self) -> Result<()> {
         let static_data = load_embedded_static_data()?;
         let mut maps = Vec::new();
@@ -726,15 +899,16 @@ impl BidKingGui {
     fn calculate(&mut self) {
         match self.calculate_inner() {
             Ok((output, auto_fill)) => {
+                let scope_warning = output.scope_warning_suffix();
                 self.status = if auto_fill.fields > 0 {
                     format!(
-                        "当前地图: {}。地图实算完成，已自动回填 {} 个唯一件数/格数字段。",
-                        output.map_label, auto_fill.fields
+                        "当前地图: {}。地图实算完成{}，已自动回填 {} 个唯一件数/格数字段。",
+                        output.map_label, scope_warning, auto_fill.fields
                     )
                 } else {
                     format!(
-                        "当前地图: {}。地图实算完成，未发现可回填的唯一件数/格数。",
-                        output.map_label
+                        "当前地图: {}。地图实算完成{}，未发现可回填的唯一件数/格数。",
+                        output.map_label, scope_warning
                     )
                 };
                 self.output = Some(output);
@@ -747,7 +921,10 @@ impl BidKingGui {
     }
 
     fn scan_screen(&mut self) {
-        let fallback_total = parse_optional_i32(&self.total).ok().flatten();
+        let fallback_total = parse_optional_i32(&self.total)
+            .ok()
+            .flatten()
+            .filter(|value| *value > 0);
         self.status = "正在截取屏幕情报区域并识别...".to_string();
         match ocr::scan_primary_screen_with_ppocrv4_onnx(fallback_total) {
             Ok(scan) => {
@@ -758,8 +935,15 @@ impl BidKingGui {
                 } else {
                     format!("；{}", scan.parsed.warnings.join("；"))
                 };
+                let scan_title = scan
+                    .parsed
+                    .round_number
+                    .as_deref()
+                    .map(|round| format!("第{round}轮视觉扫描完成"))
+                    .unwrap_or_else(|| "视觉扫描完成".to_string());
                 let scan_status = format!(
-                    "视觉扫描完成：{}，填入 {} 个字段，{} 行 {}{}",
+                    "{}：{}，填入 {} 个字段，{} 行 {}{}",
+                    scan_title,
                     map,
                     updated,
                     scan.engine,
@@ -768,19 +952,27 @@ impl BidKingGui {
                 );
                 match self.calculate_inner() {
                     Ok((output, auto_fill)) => {
+                        let scope_warning = output.scope_warning_suffix();
                         let auto_fill_status = if auto_fill.fields > 0 {
                             format!("；计算后回填 {} 个唯一件数/格数字段", auto_fill.fields)
                         } else {
                             String::new()
                         };
+                        let timing_status = debug_timing_suffix(&scan, Some(output.elapsed_ms));
                         self.status = format!(
-                            "{}。已自动计算出价：当前地图: {}{}。",
-                            scan_status, output.map_label, auto_fill_status
+                            "{}{}。已自动计算出价：当前地图: {}{}{}。",
+                            scan_status,
+                            timing_status,
+                            output.map_label,
+                            scope_warning,
+                            auto_fill_status
                         );
                         self.output = Some(output);
                     }
                     Err(err) => {
-                        self.status = format!("{scan_status}。自动计算失败: {err:#}");
+                        let timing_status = debug_timing_suffix(&scan, None);
+                        self.status =
+                            format!("{scan_status}{timing_status}。自动计算失败: {err:#}");
                         self.output = None;
                     }
                 }
@@ -793,14 +985,14 @@ impl BidKingGui {
 
     fn apply_ocr_result(&mut self, result: &ocr::OcrResult) -> usize {
         let mut updated = 0;
-        if let Some(map_name) = &result.map_name {
-            if let Some(map) = self.maps.iter().find(|m| m.name == *map_name).cloned() {
-                if let Some(tier) = tier_from_map_id(&map.map_id) {
-                    self.tier = tier.to_string();
-                }
-                self.selected_map_id = map.map_id;
-                updated += 1;
+        if let Some(map_name) = &result.map_name
+            && let Some(map) = self.maps.iter().find(|m| m.name == *map_name).cloned()
+        {
+            if let Some(tier) = tier_from_map_id(&map.map_id) {
+                self.tier = tier.to_string();
             }
+            self.selected_map_id = map.map_id;
+            updated += 1;
         }
         updated += set_if_some(&mut self.total, &result.total_all);
         updated += set_if_some(
@@ -810,23 +1002,38 @@ impl BidKingGui {
         updated += set_if_some(&mut self.total_grid, &result.global_grid_total);
         updated += set_if_some(&mut self.avg_grid_all, &result.global_avg_grid);
         updated += set_if_some(&mut self.gw_count, &result.wg_count);
+        if result.wg_count.is_some() {
+            self.auto_filled_counts.gw = false;
+        }
         updated += set_if_some(&mut self.gw_grid, &result.wg_grid);
         updated += set_if_some(&mut self.gw_avg, &result.wg_avg);
         updated += set_if_some(&mut self.blue_count, &result.blue_count);
+        if result.blue_count.is_some() {
+            self.auto_filled_counts.blue = false;
+        }
         updated += set_if_some(&mut self.blue_grid, &result.blue_grid);
         updated += set_if_some(&mut self.blue_avg, &result.blue_avg);
         updated += set_if_some(&mut self.purple_count, &result.purple_count);
+        if result.purple_count.is_some() {
+            self.auto_filled_counts.purple = false;
+        }
         updated += set_if_some(&mut self.purple_grid, &result.purple_grid);
         updated += set_if_some(&mut self.purple_avg, &result.purple_avg);
         updated += set_if_some(&mut self.gold_count, &result.gold_count);
+        if result.gold_count.is_some() {
+            self.auto_filled_counts.gold = false;
+        }
         updated += set_if_some(&mut self.gold_grid, &result.gold_grid);
         updated += set_if_some(&mut self.gold_avg, &result.gold_avg);
         updated += set_if_some(&mut self.red_count, &result.red_count);
+        if result.red_count.is_some() {
+            self.auto_filled_counts.red = false;
+        }
         updated += set_if_some(&mut self.red_grid, &result.red_grid);
         updated += set_if_some(&mut self.red_avg, &result.red_avg);
         updated += set_if_some(&mut self.manual_purple_item, &result.purple_avg_value);
         updated += set_if_some(&mut self.manual_gold_item, &result.gold_avg_value);
-        updated += set_if_some(&mut self.min_value_floor, &result.min_value_floor);
+        updated += set_monotonic_numeric_field(&mut self.min_value_floor, &result.min_value_floor);
         updated += self.merge_ocr_value_samples(&result.value_samples);
         updated += self.reconcile_grids_from_averages(result);
         updated
@@ -834,69 +1041,219 @@ impl BidKingGui {
 
     fn reconcile_grids_from_averages(&mut self, result: &ocr::OcrResult) -> usize {
         let mut updated = 0;
+        let map_grid_sizes = self.selected_map_grid_sizes();
+        updated += clear_auto_count_if_grid_average_conflicts(
+            &mut self.gw_count,
+            &mut self.auto_filled_counts.gw,
+            &self.gw_grid,
+            &self.gw_avg,
+            result.wg_count.is_some(),
+            result.wg_grid.is_some() || result.wg_avg.is_some(),
+            |count, grid, avg| grid_matches_average_for_quality(count, grid, avg, None),
+        );
+        updated += clear_auto_count_if_grid_average_conflicts(
+            &mut self.blue_count,
+            &mut self.auto_filled_counts.blue,
+            &self.blue_grid,
+            &self.blue_avg,
+            result.blue_count.is_some(),
+            result.blue_grid.is_some() || result.blue_avg.is_some(),
+            |count, grid, avg| {
+                grid_average_matches_map_or_quality(
+                    count,
+                    grid,
+                    avg,
+                    map_grid_sizes.as_ref().map(|sizes| sizes.blue.as_slice()),
+                    3,
+                )
+            },
+        );
+        updated += clear_auto_count_if_grid_average_conflicts(
+            &mut self.purple_count,
+            &mut self.auto_filled_counts.purple,
+            &self.purple_grid,
+            &self.purple_avg,
+            result.purple_count.is_some(),
+            result.purple_grid.is_some() || result.purple_avg.is_some(),
+            |count, grid, avg| {
+                grid_average_matches_map_or_quality(
+                    count,
+                    grid,
+                    avg,
+                    map_grid_sizes.as_ref().map(|sizes| sizes.purple.as_slice()),
+                    4,
+                )
+            },
+        );
+        updated += clear_auto_count_if_grid_average_conflicts(
+            &mut self.gold_count,
+            &mut self.auto_filled_counts.gold,
+            &self.gold_grid,
+            &self.gold_avg,
+            result.gold_count.is_some(),
+            result.gold_grid.is_some() || result.gold_avg.is_some(),
+            |count, grid, avg| {
+                grid_average_matches_map_or_quality(
+                    count,
+                    grid,
+                    avg,
+                    map_grid_sizes.as_ref().map(|sizes| sizes.gold.as_slice()),
+                    5,
+                )
+            },
+        );
+        updated += clear_auto_count_if_grid_average_conflicts(
+            &mut self.red_count,
+            &mut self.auto_filled_counts.red,
+            &self.red_grid,
+            &self.red_avg,
+            result.red_count.is_some(),
+            result.red_grid.is_some() || result.red_avg.is_some(),
+            |count, grid, avg| {
+                grid_average_matches_map_or_quality(
+                    count,
+                    grid,
+                    avg,
+                    map_grid_sizes.as_ref().map(|sizes| sizes.red.as_slice()),
+                    6,
+                )
+            },
+        );
         let count = self.gw_count.clone();
         let avg = self.gw_avg.clone();
-        updated += set_grid_from_average(&mut self.gw_grid, &count, &avg, result.wg_grid.is_some());
+        updated += set_grid_from_average(
+            &mut self.gw_grid,
+            &count,
+            &avg,
+            result.wg_grid.is_some(),
+            None,
+        );
         let count = self.blue_count.clone();
         let avg = self.blue_avg.clone();
-        updated += set_grid_from_average(
-            &mut self.blue_grid,
-            &count,
-            &avg,
-            result.blue_grid.is_some(),
-        );
+        if let Some(grid_sizes) = map_grid_sizes.as_ref() {
+            updated += set_grid_from_average_with_sizes(
+                &mut self.blue_grid,
+                &count,
+                &avg,
+                result.blue_grid.is_some(),
+                &grid_sizes.blue,
+            );
+        }
         let count = self.purple_count.clone();
         let avg = self.purple_avg.clone();
-        updated += set_grid_from_average(
-            &mut self.purple_grid,
-            &count,
-            &avg,
-            result.purple_grid.is_some(),
-        );
+        if let Some(grid_sizes) = map_grid_sizes.as_ref() {
+            updated += set_grid_from_average_with_sizes(
+                &mut self.purple_grid,
+                &count,
+                &avg,
+                result.purple_grid.is_some(),
+                &grid_sizes.purple,
+            );
+        }
         let count = self.gold_count.clone();
         let avg = self.gold_avg.clone();
-        updated += set_grid_from_average(
-            &mut self.gold_grid,
-            &count,
-            &avg,
-            result.gold_grid.is_some(),
-        );
+        if let Some(grid_sizes) = map_grid_sizes.as_ref() {
+            updated += set_grid_from_average_with_sizes(
+                &mut self.gold_grid,
+                &count,
+                &avg,
+                result.gold_grid.is_some(),
+                &grid_sizes.gold,
+            );
+        }
         let count = self.red_count.clone();
         let avg = self.red_avg.clone();
-        updated +=
-            set_grid_from_average(&mut self.red_grid, &count, &avg, result.red_grid.is_some());
+        if let Some(grid_sizes) = map_grid_sizes.as_ref() {
+            updated += set_grid_from_average_with_sizes(
+                &mut self.red_grid,
+                &count,
+                &avg,
+                result.red_grid.is_some(),
+                &grid_sizes.red,
+            );
+        }
         updated
     }
 
-    fn apply_unique_fields(&mut self, results: &[bidking_rs::ComboResult]) -> AutoFillSummary {
+    fn selected_map_grid_sizes(&self) -> Option<MapGridSizes> {
+        let mut core = load_embedded_core().ok()?;
+        let nest_id = core
+            .static_data
+            .map_to_nest
+            .get(&self.selected_map_id)
+            .cloned()?;
+        Some(MapGridSizes {
+            blue: core.loader.get_map_grid_sizes_by_quality(Some(&nest_id), 3),
+            purple: core.loader.get_map_grid_sizes_by_quality(Some(&nest_id), 4),
+            gold: core.loader.get_map_grid_sizes_by_quality(Some(&nest_id), 5),
+            red: core.loader.get_map_grid_sizes_by_quality(Some(&nest_id), 6),
+        })
+    }
+
+    fn apply_unique_fields(
+        &mut self,
+        results: &[bidking_rs::ComboResult],
+        grid_sizes: &MapGridSizes,
+        include_low_tiers: bool,
+    ) -> AutoFillSummary {
         let mut summary = AutoFillSummary::default();
-        summary.fields += set_unique_i32(
-            &mut self.gw_count,
-            unique_i32(results, |r| r.greenwhite_count),
-        );
-        summary.fields +=
-            set_grid_from_average(&mut self.gw_grid, &self.gw_count, &self.gw_avg, false);
-        summary.fields +=
-            set_unique_i32(&mut self.blue_count, unique_i32(results, |r| r.blue_count));
-        summary.fields +=
-            set_grid_from_average(&mut self.blue_grid, &self.blue_count, &self.blue_avg, false);
-        summary.fields += set_unique_i32(
+        if include_low_tiers {
+            summary.fields += set_unique_i32_mark(
+                &mut self.gw_count,
+                &mut self.auto_filled_counts.gw,
+                unique_i32(results, |r| r.greenwhite_count),
+            );
+            summary.fields +=
+                set_grid_from_average(&mut self.gw_grid, &self.gw_count, &self.gw_avg, false, None);
+            summary.fields += set_unique_i32_mark(
+                &mut self.blue_count,
+                &mut self.auto_filled_counts.blue,
+                unique_i32(results, |r| r.blue_count),
+            );
+            summary.fields += set_grid_from_average_with_sizes(
+                &mut self.blue_grid,
+                &self.blue_count,
+                &self.blue_avg,
+                false,
+                &grid_sizes.blue,
+            );
+        }
+        summary.fields += set_unique_i32_mark(
             &mut self.purple_count,
+            &mut self.auto_filled_counts.purple,
             unique_i32(results, |r| r.purple_count),
         );
-        summary.fields += set_grid_from_average(
+        summary.fields += set_grid_from_average_with_sizes(
             &mut self.purple_grid,
             &self.purple_count,
             &self.purple_avg,
             false,
+            &grid_sizes.purple,
         );
-        summary.fields +=
-            set_unique_i32(&mut self.gold_count, unique_i32(results, |r| r.gold_count));
-        summary.fields +=
-            set_grid_from_average(&mut self.gold_grid, &self.gold_count, &self.gold_avg, false);
-        summary.fields += set_unique_i32(&mut self.red_count, unique_i32(results, |r| r.red_count));
-        summary.fields +=
-            set_grid_from_average(&mut self.red_grid, &self.red_count, &self.red_avg, false);
+        summary.fields += set_unique_i32_mark(
+            &mut self.gold_count,
+            &mut self.auto_filled_counts.gold,
+            unique_i32(results, |r| r.gold_count),
+        );
+        summary.fields += set_grid_from_average_with_sizes(
+            &mut self.gold_grid,
+            &self.gold_count,
+            &self.gold_avg,
+            false,
+            &grid_sizes.gold,
+        );
+        summary.fields += set_unique_i32_mark(
+            &mut self.red_count,
+            &mut self.auto_filled_counts.red,
+            unique_i32(results, |r| r.red_count),
+        );
+        summary.fields += set_grid_from_average_with_sizes(
+            &mut self.red_grid,
+            &self.red_count,
+            &self.red_avg,
+            false,
+            &grid_sizes.red,
+        );
         summary
     }
 
@@ -913,21 +1270,25 @@ impl BidKingGui {
             .cloned()
             .with_context(|| format!("未知地图 {}", self.selected_map_id))?;
         let display_count = MAX_VISIBLE_COMBOS;
-        let total_count = parse_i32(&self.total, "总件数")?;
-        if total_count <= 0 {
-            anyhow::bail!("请先填写大于 0 的总件数");
+        let total_count = parse_optional_i32(&self.total)?.unwrap_or_default();
+        let high_quality_count = parse_optional_i32(&self.high_quality_count)?;
+        if total_count < 0 {
+            anyhow::bail!("总件数不能为负数");
+        }
+        if total_count <= 0 && high_quality_count.unwrap_or_default() <= 0 {
+            anyhow::bail!("请填写总件数，或填写大于 0 的紫金红总数");
         }
         let min_value_floor = parse_optional_f64(&self.min_value_floor)?;
         if min_value_floor.is_some_and(|value| value < 0.0) {
             anyhow::bail!("当前预估最低价格不能为负数");
         }
-        let cp = CalcParams {
+        let cp = normalize_calc_params(CalcParams {
             tier: self.tier.trim().to_string(),
             map_nest_id: nest_id,
             total_count,
             total_grid_target: parse_optional_f64(&self.total_grid)?,
             avg_grid_all: parse_optional_f64(&self.avg_grid_all)?,
-            high_quality_count: parse_optional_i32(&self.high_quality_count)?,
+            high_quality_count,
             safety_factor: parse_f64(&self.safety, "安全系数")?,
             max_show: display_count,
             gw_count: parse_optional_i32(&self.gw_count)?,
@@ -956,9 +1317,11 @@ impl BidKingGui {
             manual_gold_per_item: parse_optional_f64(&self.manual_gold_item)?,
             manual_gold_per_grid: parse_optional_f64(&self.manual_gold_grid)?,
             value_samples: self.parse_value_samples()?,
-        };
+        });
         let results = core.run(cp.clone())?;
-        let (p25, p50, p75) = core.price_range(&results, &cp);
+        let high_quality_only =
+            cp.total_count <= 0 && cp.high_quality_count.unwrap_or_default() > 0;
+        let (p25, p50, p75) = core.price_range_for_last_run(&cp);
         let purple_range = range_for(&results, |r| r.purple_count);
         let gold_range = range_for(&results, |r| r.gold_count);
         let red_range = range_for(&results, |r| r.red_count);
@@ -966,7 +1329,22 @@ impl BidKingGui {
             .first()
             .map(|top| core.combo_composition_lines(top, &cp))
             .unwrap_or_default();
-        let auto_fill = self.apply_unique_fields(&results);
+        let grid_sizes = MapGridSizes {
+            blue: core
+                .loader
+                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 3),
+            purple: core
+                .loader
+                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 4),
+            gold: core
+                .loader
+                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 5),
+            red: core
+                .loader
+                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 6),
+        };
+        let auto_fill =
+            self.apply_unique_fields(&core.raw_results, &grid_sizes, cp.total_count > 0);
         let rows = results
             .iter()
             .take(display_count)
@@ -986,9 +1364,9 @@ impl BidKingGui {
             CalculationOutput {
                 combos: results.len(),
                 raw: core.raw_results.len(),
-                p25: (p25 * cp.safety_factor).round() as i64,
-                p50: (p50 * cp.safety_factor).round() as i64,
-                p75: (p75 * cp.safety_factor).round() as i64,
+                p25: recommended_bid_value(p25, &cp).round() as i64,
+                p50: recommended_bid_value(p50, &cp).round() as i64,
+                p75: recommended_bid_value(p75, &cp).round() as i64,
                 purple_range,
                 gold_range,
                 red_range,
@@ -996,6 +1374,7 @@ impl BidKingGui {
                 elapsed_ms: start.elapsed().as_millis(),
                 map_label,
                 composition_lines,
+                high_quality_only,
             },
             auto_fill,
         ))
@@ -1012,12 +1391,8 @@ impl BidKingGui {
             if count_text.is_empty() || avg_text.is_empty() {
                 anyhow::bail!("随机样本第 {} 行需要同时填写件数和均价", index + 1);
             }
-            let count = count_text
-                .parse::<i32>()
-                .with_context(|| format!("随机样本第 {} 行件数不是有效整数", index + 1))?;
-            let avg_value = avg_text
-                .parse::<f64>()
-                .with_context(|| format!("随机样本第 {} 行均价不是有效数字", index + 1))?;
+            let count = parse_i32(count_text, &format!("随机样本第 {} 行件数", index + 1))?;
+            let avg_value = parse_f64(avg_text, &format!("随机样本第 {} 行均价", index + 1))?;
             if count <= 0 {
                 anyhow::bail!("随机样本第 {} 行件数必须大于 0", index + 1);
             }
@@ -1032,10 +1407,11 @@ impl BidKingGui {
     fn merge_ocr_value_samples(&mut self, samples: &[ocr::OcrValueSample]) -> usize {
         let mut updated = 0;
         for sample in samples {
-            if self.value_samples.iter().any(|existing| {
-                existing.count.trim() == sample.count.trim()
-                    && existing.avg_value.trim() == sample.avg_value.trim()
-            }) {
+            if self
+                .value_samples
+                .iter()
+                .any(|existing| value_samples_match(existing, sample))
+            {
                 continue;
             }
             self.value_samples.push(ValueSampleInput {
@@ -1058,9 +1434,11 @@ impl BidKingGui {
         let maps = self.maps.clone();
         let global_hotkeys = self.global_hotkeys.take();
         let window_topmost = self.window_topmost;
-        let mut fresh = Self::default();
+        let mini_mode = self.mini_mode;
+        let mut fresh = Self::new_form_state();
         fresh.maps = maps;
         fresh.window_topmost = window_topmost;
+        fresh.mini_mode = mini_mode;
         fresh.global_hotkeys = global_hotkeys;
         fresh.status = "已重置条件。".to_string();
         *self = fresh;
@@ -1392,16 +1770,28 @@ fn accent_bar(ui: &mut egui::Ui, accent: egui::Color32) {
 
 fn result_table(ui: &mut egui::Ui, rows: &[UiCombo]) {
     let outer_width = ui.available_width();
+    let compact = outer_width <= MINI_WINDOW_MAX_SIZE.x;
     egui::Frame::default()
         .fill(color_panel())
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_min_width((outer_width - 22.0).max(560.0));
-            let col_width = (ui.available_width() / 8.0).max(64.0);
+            let table_width = if compact {
+                (outer_width - 22.0).max(0.0)
+            } else {
+                (outer_width - 22.0).max(560.0)
+            };
+            ui.set_min_width(table_width);
+            let col_width = if compact {
+                ((ui.available_width() - 28.0) / 8.0).clamp(42.0, 66.0)
+            } else {
+                (ui.available_width() / 8.0).max(64.0)
+            };
+            let spacing_x = if compact { 4.0 } else { 8.0 };
             egui::Grid::new("result_grid")
                 .striped(true)
+                .spacing(egui::vec2(spacing_x, 4.0))
                 .min_col_width(col_width)
                 .min_row_height(25.0)
                 .num_columns(8)
@@ -1441,16 +1831,28 @@ fn result_table(ui: &mut egui::Ui, rows: &[UiCombo]) {
 
 fn empty_table(ui: &mut egui::Ui) {
     let outer_width = ui.available_width();
+    let compact = outer_width <= MINI_WINDOW_MAX_SIZE.x;
     egui::Frame::default()
         .fill(color_panel())
         .stroke(egui::Stroke::new(1.0, color_border()))
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_min_width((outer_width - 22.0).max(560.0));
-            let col_width = (ui.available_width() / 8.0).max(64.0);
+            let table_width = if compact {
+                (outer_width - 22.0).max(0.0)
+            } else {
+                (outer_width - 22.0).max(560.0)
+            };
+            ui.set_min_width(table_width);
+            let col_width = if compact {
+                ((ui.available_width() - 28.0) / 8.0).clamp(42.0, 66.0)
+            } else {
+                (ui.available_width() / 8.0).max(64.0)
+            };
+            let spacing_x = if compact { 4.0 } else { 8.0 };
             egui::Grid::new("empty_result_grid")
                 .striped(true)
+                .spacing(egui::vec2(spacing_x, 4.0))
                 .min_col_width(col_width)
                 .min_row_height(25.0)
                 .num_columns(8)
@@ -1563,7 +1965,7 @@ fn parse_optional_i32(text: &str) -> Result<Option<i32>> {
     if text.is_empty() {
         return Ok(None);
     }
-    Ok(Some(text.parse()?))
+    Ok(Some(parse_integer_text(text)?))
 }
 
 fn parse_optional_f64(text: &str) -> Result<Option<f64>> {
@@ -1571,19 +1973,89 @@ fn parse_optional_f64(text: &str) -> Result<Option<f64>> {
     if text.is_empty() {
         return Ok(None);
     }
-    Ok(Some(text.parse()?))
+    Ok(Some(parse_float_text(text)?))
 }
 
 fn parse_i32(text: &str, name: &str) -> Result<i32> {
-    text.trim()
-        .parse()
-        .with_context(|| format!("{name} 不是有效整数"))
+    parse_integer_text(text.trim()).with_context(|| format!("{name} 不是有效整数"))
 }
 
 fn parse_f64(text: &str, name: &str) -> Result<f64> {
-    text.trim()
-        .parse()
-        .with_context(|| format!("{name} 不是有效数字"))
+    parse_float_text(text.trim()).with_context(|| format!("{name} 不是有效数字"))
+}
+
+fn parse_integer_text(text: &str) -> Result<i32> {
+    let normalized = normalize_numeric_text(text, false);
+    Ok(normalized.parse()?)
+}
+
+fn parse_float_text(text: &str) -> Result<f64> {
+    let normalized = normalize_numeric_text(text, true);
+    Ok(normalized.parse()?)
+}
+
+fn normalize_numeric_text(text: &str, allow_decimal_comma: bool) -> String {
+    let mut text = text
+        .trim()
+        .replace([' ', '_'], "")
+        .replace('，', ",")
+        .replace('．', ".");
+    if text.contains(',') {
+        if looks_like_thousands_number(&text) {
+            text = text.replace(',', "");
+        } else if allow_decimal_comma && !text.contains('.') && text.matches(',').count() == 1 {
+            text = text.replace(',', ".");
+        }
+    }
+    if allow_decimal_comma && text.matches('.').count() > 1 {
+        text = normalize_dot_grouped_decimal(&text);
+    }
+    text
+}
+
+fn looks_like_thousands_number(text: &str) -> bool {
+    let integer = text
+        .trim_start_matches(['+', '-'])
+        .split_once('.')
+        .map(|(integer, _)| integer)
+        .unwrap_or_else(|| text.trim_start_matches(['+', '-']));
+    let groups = integer.split(',').collect::<Vec<_>>();
+    groups.len() > 1
+        && (1..=3).contains(&groups[0].len())
+        && groups[0].chars().all(|ch| ch.is_ascii_digit())
+        && groups[1..]
+            .iter()
+            .all(|group| group.len() == 3 && group.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn normalize_dot_grouped_decimal(text: &str) -> String {
+    let sign = if text.starts_with('-') {
+        "-"
+    } else if text.starts_with('+') {
+        "+"
+    } else {
+        ""
+    };
+    let unsigned = text.trim_start_matches(['+', '-']);
+    let groups = unsigned.split('.').collect::<Vec<_>>();
+    if groups.len() > 2
+        && (1..=3).contains(&groups[0].len())
+        && groups[0].chars().all(|ch| ch.is_ascii_digit())
+        && groups[1..groups.len() - 1]
+            .iter()
+            .all(|group| group.len() == 3 && group.chars().all(|ch| ch.is_ascii_digit()))
+        && groups.last().is_some_and(|group| {
+            (1..=2).contains(&group.len()) && group.chars().all(|ch| ch.is_ascii_digit())
+        })
+    {
+        format!(
+            "{sign}{}.{}",
+            groups[..groups.len() - 1].join(""),
+            groups[groups.len() - 1]
+        )
+    } else {
+        text.to_string()
+    }
 }
 
 fn set_if_some(target: &mut String, value: &Option<String>) -> usize {
@@ -1592,6 +2064,43 @@ fn set_if_some(target: &mut String, value: &Option<String>) -> usize {
         1
     } else {
         0
+    }
+}
+
+fn set_monotonic_numeric_field(target: &mut String, value: &Option<String>) -> usize {
+    let Some(value) = value else {
+        return 0;
+    };
+    if target.trim() == value.trim() {
+        0
+    } else {
+        match (parse_float_text(target), parse_float_text(value)) {
+            (Ok(current), Ok(incoming)) if incoming <= current => 0,
+            _ => {
+                *target = value.clone();
+                1
+            }
+        }
+    }
+}
+
+fn value_samples_match(existing: &ValueSampleInput, sample: &ocr::OcrValueSample) -> bool {
+    let existing_count = parse_optional_i32(&existing.count).ok().flatten();
+    let incoming_count = parse_optional_i32(&sample.count).ok().flatten();
+    if existing_count != incoming_count {
+        return false;
+    }
+    let existing_avg = parse_optional_f64(&existing.avg_value).ok().flatten();
+    let incoming_avg = parse_optional_f64(&sample.avg_value).ok().flatten();
+    match (existing_avg, incoming_avg) {
+        (Some(existing_avg), Some(incoming_avg)) => {
+            let tolerance = existing_avg
+                .abs()
+                .max(incoming_avg.abs())
+                .mul_add(0.01, 1.0);
+            (existing_avg - incoming_avg).abs() <= tolerance
+        }
+        _ => existing.avg_value.trim() == sample.avg_value.trim(),
     }
 }
 
@@ -1607,31 +2116,116 @@ fn set_unique_i32(target: &mut String, value: Option<i32>) -> usize {
     1
 }
 
+fn set_unique_i32_mark(target: &mut String, marker: &mut bool, value: Option<i32>) -> usize {
+    let Some(value) = value else {
+        return 0;
+    };
+    let value = value.to_string();
+    if target.trim() == value {
+        return 0;
+    }
+    *target = value;
+    *marker = true;
+    1
+}
+
+fn clear_auto_count_if_grid_average_conflicts(
+    count_text: &mut String,
+    auto_marker: &mut bool,
+    grid_text: &str,
+    avg_text: &str,
+    direct_count_seen: bool,
+    direct_grid_or_avg_seen: bool,
+    matches: impl Fn(i32, i32, f64) -> bool,
+) -> usize {
+    if !*auto_marker || direct_count_seen || !direct_grid_or_avg_seen {
+        return 0;
+    }
+    let count = parse_optional_i32(count_text).ok().flatten();
+    let grid = parse_optional_f64(grid_text)
+        .ok()
+        .flatten()
+        .map(round_grid_value);
+    let avg = parse_optional_f64(avg_text).ok().flatten();
+    let Some((count, grid, avg)) = count
+        .zip(grid)
+        .zip(avg)
+        .map(|((count, grid), avg)| (count, grid, avg))
+    else {
+        return 0;
+    };
+    if count <= 0 || matches(count, grid, avg) {
+        return 0;
+    }
+    count_text.clear();
+    *auto_marker = false;
+    1
+}
+
+fn grid_average_matches_map_or_quality(
+    count: i32,
+    grid: i32,
+    avg: f64,
+    map_grid_sizes: Option<&[i32]>,
+    quality: i32,
+) -> bool {
+    if let Some(map_grid_sizes) = map_grid_sizes
+        && !map_grid_sizes.is_empty()
+    {
+        return grid_matches_average_with_sizes(count, grid, avg, map_grid_sizes);
+    }
+    grid_matches_average_for_quality(count, grid, avg, Some(quality))
+}
+
+fn round_grid_value(value: f64) -> i32 {
+    let floor = value.floor();
+    let frac = value - floor;
+    if (frac - 0.5).abs() < 1e-12 {
+        let floor_i = floor as i32;
+        if floor_i % 2 == 0 {
+            floor_i
+        } else {
+            floor_i + 1
+        }
+    } else {
+        value.round() as i32
+    }
+}
+
 fn set_grid_from_average(
     target: &mut String,
     count_text: &str,
     avg_text: &str,
     direct_grid_seen: bool,
+    quality: Option<i32>,
 ) -> usize {
     if direct_grid_seen {
         return 0;
     }
     let count = parse_optional_i32(count_text).ok().flatten();
     let avg = parse_optional_f64(avg_text).ok().flatten();
-    set_unique_i32(target, infer_grid_from_average(count, avg))
+    let grid = count
+        .zip(avg)
+        .and_then(|(count, avg)| infer_grid_from_average_for_quality(count, avg, quality));
+    set_unique_i32(target, grid)
 }
 
-fn infer_grid_from_average(count: Option<i32>, avg: Option<f64>) -> Option<i32> {
-    let count = count?;
-    let avg = avg?;
-    if count <= 0 || !avg.is_finite() || avg <= 0.0 {
-        return None;
+fn set_grid_from_average_with_sizes(
+    target: &mut String,
+    count_text: &str,
+    avg_text: &str,
+    direct_grid_seen: bool,
+    grid_sizes: &[i32],
+) -> usize {
+    if direct_grid_seen {
+        return 0;
     }
-    let target = (avg * 100.0 + 1e-7).floor() as i32;
-    let mut matches = (count..=18 * count)
-        .filter(|grid| ((*grid as f64 * 100.0 / count as f64) + 1e-7).floor() as i32 == target);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
+    let count = parse_optional_i32(count_text).ok().flatten();
+    let avg = parse_optional_f64(avg_text).ok().flatten();
+    let grid = count
+        .zip(avg)
+        .and_then(|(count, avg)| infer_grid_from_average_with_sizes(count, avg, grid_sizes));
+    set_unique_i32(target, grid)
 }
 
 fn unique_i32(
@@ -1687,6 +2281,45 @@ fn tier_from_map_id(map_id: &str) -> Option<&'static str> {
         },
         _ => None,
     }
+}
+
+fn start_ocr_warmup(ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    let _ = thread::Builder::new()
+        .name("bidking-ocr-warmup".to_string())
+        .spawn(move || {
+            let _ = ocr::warm_up_ppocrv4_onnx();
+            ctx.request_repaint();
+        });
+}
+
+fn debug_timing_suffix(scan: &ocr::OcrScan, calc_ms: Option<u128>) -> String {
+    if !debug_timing_enabled() {
+        return String::new();
+    }
+    let timings = scan.timings;
+    let calc_text = calc_ms
+        .map(|value| format!("，计算 {value} ms"))
+        .unwrap_or_default();
+    let total_ms = timings.total_ms + calc_ms.unwrap_or_default();
+    format!(
+        "；调试耗时: 取图 {} ms，预处理 {} ms，OCR {} ms，解析 {} ms{}，总计 {} ms",
+        timings.source_ms,
+        timings.preprocess_ms + timings.crop_save_ms,
+        timings.ocr_ms,
+        timings.parse_ms,
+        calc_text,
+        total_ms
+    )
+}
+
+fn debug_timing_enabled() -> bool {
+    env::var("BIDKING_DEBUG_TIMING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -1970,4 +2603,214 @@ fn color_purple() -> egui::Color32 {
 
 fn color_red() -> egui::Color32 {
     egui::Color32::from_rgb(255, 113, 124)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_value_floor_ocr_field_is_monotonic_within_a_round_sequence() {
+        let mut value = "371868".to_string();
+        assert_eq!(set_monotonic_numeric_field(&mut value, &None), 0);
+        assert_eq!(value, "371868");
+
+        let lower_misread = Some("370000".to_string());
+        assert_eq!(set_monotonic_numeric_field(&mut value, &lower_misread), 0);
+        assert_eq!(value, "371868");
+
+        let higher = Some("401856".to_string());
+        assert_eq!(set_monotonic_numeric_field(&mut value, &higher), 1);
+        assert_eq!(value, "401856");
+        assert_eq!(set_monotonic_numeric_field(&mut value, &higher), 0);
+    }
+
+    #[test]
+    fn ocr_value_samples_deduplicate_small_rescan_noise() {
+        let existing = ValueSampleInput {
+            count: "3".to_string(),
+            avg_value: "611.33".to_string(),
+        };
+        let close_rescan = ocr::OcrValueSample {
+            count: "3".to_string(),
+            avg_value: "611.38".to_string(),
+        };
+        let distinct_sample = ocr::OcrValueSample {
+            count: "3".to_string(),
+            avg_value: "700.00".to_string(),
+        };
+        let different_count = ocr::OcrValueSample {
+            count: "6".to_string(),
+            avg_value: "611.38".to_string(),
+        };
+
+        assert!(value_samples_match(&existing, &close_rescan));
+        assert!(!value_samples_match(&existing, &distinct_sample));
+        assert!(!value_samples_match(&existing, &different_count));
+    }
+
+    #[test]
+    fn gui_can_calculate_from_high_quality_total_without_total_count() {
+        let mut app = BidKingGui {
+            total: "0".to_string(),
+            high_quality_count: "6".to_string(),
+            ..Default::default()
+        };
+
+        let (output, _) = app.calculate_inner().unwrap();
+
+        assert!(!output.rows.is_empty());
+        assert!(output.high_quality_only);
+        assert!(output.scope_warning_suffix().contains("仅紫金红模式"));
+        assert_eq!(app.gw_count, "");
+        assert_eq!(app.blue_count, "");
+        assert!(
+            output
+                .rows
+                .iter()
+                .all(|row| row.greenwhite == 0 && row.blue == 0)
+        );
+    }
+
+    #[test]
+    fn case4_round3_clears_stale_auto_filled_greenwhite_count() {
+        let mut app = BidKingGui::default();
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("1".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("46".to_string()),
+            wg_grid: Some("20".to_string()),
+            purple_avg: Some("3".to_string()),
+            ..Default::default()
+        });
+        let (round1, _) = app.calculate_inner().unwrap();
+        assert!(!round1.rows.is_empty());
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("2".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("46".to_string()),
+            wg_grid: Some("20".to_string()),
+            blue_count: Some("19".to_string()),
+            purple_avg: Some("3".to_string()),
+            gold_avg: Some("2.8".to_string()),
+            ..Default::default()
+        });
+        let (round2, _) = app.calculate_inner().unwrap();
+        assert!(!round2.rows.is_empty());
+        app.gw_count = "17".to_string();
+        app.auto_filled_counts.gw = true;
+        app.gold_count = "5".to_string();
+        app.gold_grid = "14".to_string();
+        assert_eq!(app.gw_count, "17");
+
+        app.total_grid = "99".to_string();
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("3".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("46".to_string()),
+            wg_grid: Some("20".to_string()),
+            wg_avg: Some("2".to_string()),
+            blue_count: Some("19".to_string()),
+            purple_avg: Some("3".to_string()),
+            gold_avg: Some("2.8".to_string()),
+            min_value_floor: Some("9168".to_string()),
+            ..Default::default()
+        });
+        let (round3, _) = app.calculate_inner().unwrap();
+
+        assert!(!round3.rows.is_empty());
+        assert_eq!(app.gw_count, "10");
+        assert!(round3.p50 > 0);
+    }
+
+    #[test]
+    fn case1_round3_gui_sequence_still_calculates() {
+        let mut app = BidKingGui::default();
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("1".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("36".to_string()),
+            wg_grid: Some("27".to_string()),
+            min_value_floor: Some("11218".to_string()),
+            ..Default::default()
+        });
+        let (round1, _) = app.calculate_inner().unwrap();
+        assert!(!round1.rows.is_empty());
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("2".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("36".to_string()),
+            wg_grid: Some("27".to_string()),
+            wg_avg: Some("2.25".to_string()),
+            gold_avg: Some("5".to_string()),
+            min_value_floor: Some("11218".to_string()),
+            ..Default::default()
+        });
+        let (round2, _) = app.calculate_inner().unwrap();
+        assert!(!round2.rows.is_empty());
+        assert_eq!(app.gw_count, "12");
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("3".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            total_all: Some("36".to_string()),
+            wg_grid: Some("27".to_string()),
+            wg_avg: Some("2.25".to_string()),
+            blue_count: Some("11".to_string()),
+            purple_avg: Some("2.36".to_string()),
+            gold_avg: Some("5".to_string()),
+            gold_avg_value: Some("43087.5".to_string()),
+            min_value_floor: Some("11218".to_string()),
+            ..Default::default()
+        });
+        let (round3, _) = app.calculate_inner().unwrap();
+
+        assert!(round3.p50 > 0);
+        assert!(!round3.rows.is_empty());
+        assert_eq!(app.blue_count, "11");
+        assert_eq!(app.purple_count, "11");
+        assert_eq!(app.gold_count, "2");
+        assert_eq!(app.red_count, "0");
+        assert!(
+            round3.p25 < round3.p50 && round3.p50 < round3.p75,
+            "unique count combo should still keep an item-level price interval"
+        );
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("4".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            wg_grid: Some("27".to_string()),
+            wg_avg: Some("2.25".to_string()),
+            blue_count: Some("11".to_string()),
+            blue_avg: Some("2.54".to_string()),
+            purple_avg: Some("2.36".to_string()),
+            gold_avg: Some("5".to_string()),
+            gold_avg_value: Some("43087.5".to_string()),
+            min_value_floor: Some("11218".to_string()),
+            ..Default::default()
+        });
+        let (round4, _) = app.calculate_inner().unwrap();
+        assert!(!round4.rows.is_empty());
+        assert_eq!(app.blue_grid, "28");
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("5".to_string()),
+            map_name: Some("未知别墅".to_string()),
+            wg_count: Some("12".to_string()),
+            wg_avg: Some("2.25".to_string()),
+            blue_count: Some("11".to_string()),
+            blue_avg: Some("2.54".to_string()),
+            purple_avg: Some("2.36".to_string()),
+            gold_avg: Some("5".to_string()),
+            gold_avg_value: Some("43087.5".to_string()),
+            min_value_floor: Some("11218".to_string()),
+            ..Default::default()
+        });
+        let (round5, _) = app.calculate_inner().unwrap();
+        assert!(!round5.rows.is_empty());
+    }
 }

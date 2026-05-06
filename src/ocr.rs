@@ -4,7 +4,8 @@ use paddle_ocr_rs::ocr_lite::OcrLite;
 use regex::Regex;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAP_NAMES: &[&str] = &[
     "未知快递",
@@ -59,6 +60,10 @@ const MAP_ALIASES: &[(&str, &str)] = &[
     ("隐密拍卖", "隐秘拍卖会"),
 ];
 
+static PPOCRV4_ENGINE: OnceLock<std::result::Result<Mutex<PpOcrV4Engine>, String>> =
+    OnceLock::new();
+static ORT_INIT_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureRect {
     pub x: u32,
@@ -69,6 +74,7 @@ pub struct CaptureRect {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OcrResult {
+    pub round_number: Option<String>,
     pub total_all: Option<String>,
     pub global_grid_total: Option<String>,
     pub global_avg_grid: Option<String>,
@@ -109,9 +115,56 @@ pub struct OcrScan {
     pub lines: Vec<String>,
     pub parsed: OcrResult,
     pub crop_path: PathBuf,
+    pub timings: OcrTimings,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OcrTimings {
+    pub source_ms: u128,
+    pub preprocess_ms: u128,
+    pub crop_save_ms: u128,
+    pub ocr_ms: u128,
+    pub parse_ms: u128,
+    pub total_ms: u128,
 }
 
 pub fn default_capture_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+    if use_legacy_ocr_regions() {
+        return legacy_capture_rect(screen_width, screen_height);
+    }
+    CaptureRect {
+        x: (screen_width as f64 * 0.255) as u32,
+        y: (screen_height as f64 * 0.105) as u32,
+        width: (screen_width as f64 * 0.345) as u32,
+        height: (screen_height as f64 * 0.58) as u32,
+    }
+}
+
+pub fn default_min_value_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+    if use_legacy_ocr_regions() {
+        return legacy_min_value_rect(screen_width, screen_height);
+    }
+    CaptureRect {
+        x: (screen_width as f64 * 0.735) as u32,
+        y: (screen_height as f64 * 0.835) as u32,
+        width: (screen_width as f64 * 0.25) as u32,
+        height: (screen_height as f64 * 0.075) as u32,
+    }
+}
+
+pub fn default_round_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+    if use_legacy_ocr_regions() {
+        return legacy_round_rect(screen_width, screen_height);
+    }
+    CaptureRect {
+        x: (screen_width as f64 * 0.335) as u32,
+        y: (screen_height as f64 * 0.070) as u32,
+        width: (screen_width as f64 * 0.190) as u32,
+        height: (screen_height as f64 * 0.050) as u32,
+    }
+}
+
+fn legacy_capture_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
     CaptureRect {
         x: (screen_width as f64 * 0.225) as u32,
         y: (screen_height as f64 * 0.105) as u32,
@@ -120,7 +173,7 @@ pub fn default_capture_rect(screen_width: u32, screen_height: u32) -> CaptureRec
     }
 }
 
-pub fn default_min_value_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+fn legacy_min_value_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
     CaptureRect {
         x: (screen_width as f64 * 0.66) as u32,
         y: (screen_height as f64 * 0.80) as u32,
@@ -129,9 +182,24 @@ pub fn default_min_value_rect(screen_width: u32, screen_height: u32) -> CaptureR
     }
 }
 
+fn legacy_round_rect(screen_width: u32, screen_height: u32) -> CaptureRect {
+    CaptureRect {
+        x: (screen_width as f64 * 0.31) as u32,
+        y: (screen_height as f64 * 0.055) as u32,
+        width: (screen_width as f64 * 0.38) as u32,
+        height: (screen_height as f64 * 0.07) as u32,
+    }
+}
+
 pub fn crop_info_region(image: &DynamicImage) -> DynamicImage {
     let (screen_width, screen_height) = image.dimensions();
     let rect = default_capture_rect(screen_width, screen_height);
+    crop_region(image, rect)
+}
+
+pub fn crop_round_region(image: &DynamicImage) -> DynamicImage {
+    let (screen_width, screen_height) = image.dimensions();
+    let rect = default_round_rect(screen_width, screen_height);
     crop_region(image, rect)
 }
 
@@ -142,16 +210,18 @@ pub fn crop_min_value_region(image: &DynamicImage) -> DynamicImage {
 }
 
 pub fn crop_ocr_regions(image: &DynamicImage) -> RgbImage {
+    let round = crop_round_region(image).to_rgb8();
     let info = crop_info_region(image).to_rgb8();
     let min_value = crop_min_value_region(image).to_rgb8();
-    stitch_regions(&[info, min_value])
+    stitch_regions(&[round, info, min_value])
 }
 
 pub fn capture_primary_screen_info_region() -> Result<RgbImage> {
     let (screen_width, screen_height) = primary_screen_size()?;
+    let round = capture_screen_rect(default_round_rect(screen_width, screen_height))?;
     let info = capture_screen_rect(default_capture_rect(screen_width, screen_height))?;
     let min_value = capture_screen_rect(default_min_value_rect(screen_width, screen_height))?;
-    Ok(stitch_regions(&[info, min_value]))
+    Ok(stitch_regions(&[round, info, min_value]))
 }
 
 fn crop_region(image: &DynamicImage, rect: CaptureRect) -> DynamicImage {
@@ -309,52 +379,47 @@ pub fn scan_screenshot_with_ppocrv4_onnx(
     image_path: impl AsRef<Path>,
     fallback_ceiling: Option<i32>,
 ) -> Result<OcrScan> {
+    let started = Instant::now();
     let image_path = image_path.as_ref();
     let image =
         image::open(image_path).with_context(|| format!("open {}", image_path.display()))?;
     let crop = crop_ocr_regions(&image);
-    run_ppocrv4_onnx(crop, image_path, fallback_ceiling)
+    run_ppocrv4_onnx(crop, image_path, fallback_ceiling, started)
 }
 
 pub fn scan_primary_screen_with_ppocrv4_onnx(fallback_ceiling: Option<i32>) -> Result<OcrScan> {
+    let started = Instant::now();
     let crop = capture_primary_screen_info_region()?;
-    run_ppocrv4_onnx(crop, Path::new("primary-screen"), fallback_ceiling)
+    run_ppocrv4_onnx(crop, Path::new("primary-screen"), fallback_ceiling, started)
+}
+
+pub fn warm_up_ppocrv4_onnx() -> Result<()> {
+    with_ppocrv4_engine(|_| Ok(()))
 }
 
 fn run_ppocrv4_onnx(
     crop: RgbImage,
     source: &Path,
     fallback_ceiling: Option<i32>,
+    started: Instant,
 ) -> Result<OcrScan> {
-    let model_dir = find_ppocrv4_model_dir().context(
-        "找不到 PP-OCRv4 ONNX 模型目录。请设置 BIDKING_PPOCRV4_DIR，或把模型放在 models\\ppocrv4",
-    )?;
-    let models = PpOcrV4Models::new(&model_dir)?;
+    let source_ms = started.elapsed().as_millis();
+    let step = Instant::now();
+    let scale = ocr_resize_scale();
     let enlarged = image::imageops::resize(
         &crop,
-        crop.width() * 2,
-        crop.height() * 2,
-        FilterType::Lanczos3,
+        crop.width() * scale,
+        crop.height() * scale,
+        ocr_resize_filter(),
     );
-    let crop_path = temp_crop_path(source);
-    enlarged
-        .save(&crop_path)
-        .with_context(|| format!("save OCR crop {}", crop_path.display()))?;
-
-    ort::init_from(models.onnxruntime.to_string_lossy())
-        .commit()
-        .map_err(|err| anyhow::anyhow!("load ONNX Runtime: {err}"))?;
-    let mut ocr = OcrLite::new();
-    ocr.init_models(
-        &models.det.to_string_lossy(),
-        &models.cls.to_string_lossy(),
-        &models.rec.to_string_lossy(),
-        2,
-    )
-    .map_err(|err| anyhow::anyhow!("init PP-OCRv4 ONNX models: {err}"))?;
-    let result = ocr
-        .detect(&enlarged, 50, 1600, 0.45, 0.30, 1.60, false, false)
-        .map_err(|err| anyhow::anyhow!("run PP-OCRv4 ONNX OCR: {err}"))?;
+    let preprocess_ms = step.elapsed().as_millis();
+    let step = Instant::now();
+    let crop_path = save_crop_if_requested(&enlarged, source)?;
+    let crop_save_ms = step.elapsed().as_millis();
+    let step = Instant::now();
+    let result = with_ppocrv4_engine(|engine| engine.detect(&enlarged))?;
+    let ocr_ms = step.elapsed().as_millis();
+    let step = Instant::now();
     let mut blocks = result.text_blocks;
     blocks.sort_by_key(|block| {
         let min_y = block
@@ -377,12 +442,78 @@ fn run_ppocrv4_onnx(
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let parsed = parse_ocr_lines(&lines, fallback_ceiling);
+    let parse_ms = step.elapsed().as_millis();
     Ok(OcrScan {
         engine: "ppocrv4-onnx".to_string(),
         lines,
         parsed,
         crop_path,
+        timings: OcrTimings {
+            source_ms,
+            preprocess_ms,
+            crop_save_ms,
+            ocr_ms,
+            parse_ms,
+            total_ms: started.elapsed().as_millis(),
+        },
     })
+}
+
+struct PpOcrV4Engine {
+    ocr: OcrLite,
+}
+
+impl PpOcrV4Engine {
+    fn new() -> Result<Self> {
+        let model_dir = find_ppocrv4_model_dir().context(
+            "找不到 PP-OCRv4 ONNX 模型目录。请设置 BIDKING_PPOCRV4_DIR，或把模型放在 models\\ppocrv4",
+        )?;
+        let models = PpOcrV4Models::new(&model_dir)?;
+        init_onnxruntime(&models.onnxruntime)?;
+        let mut ocr = OcrLite::new();
+        ocr.init_models(
+            &models.det.to_string_lossy(),
+            &models.cls.to_string_lossy(),
+            &models.rec.to_string_lossy(),
+            2,
+        )
+        .map_err(|err| anyhow::anyhow!("init PP-OCRv4 ONNX models: {err}"))?;
+        Ok(Self { ocr })
+    }
+
+    fn detect(&mut self, image: &RgbImage) -> Result<paddle_ocr_rs::ocr_result::OcrResult> {
+        self.ocr
+            .detect(image, 50, 1600, 0.45, 0.30, 1.60, false, false)
+            .map_err(|err| anyhow::anyhow!("run PP-OCRv4 ONNX OCR: {err}"))
+    }
+}
+
+fn with_ppocrv4_engine<T>(f: impl FnOnce(&mut PpOcrV4Engine) -> Result<T>) -> Result<T> {
+    let engine = PPOCRV4_ENGINE.get_or_init(|| {
+        PpOcrV4Engine::new()
+            .map(Mutex::new)
+            .map_err(|err| format!("{err:#}"))
+    });
+    let engine = engine
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!("init PP-OCRv4 ONNX models: {err}"))?;
+    let mut engine = engine
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PP-OCRv4 ONNX engine lock poisoned"))?;
+    f(&mut engine)
+}
+
+fn init_onnxruntime(path: &Path) -> Result<()> {
+    ORT_INIT_RESULT
+        .get_or_init(|| {
+            ort::init_from(path.to_string_lossy())
+                .commit()
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("load ONNX Runtime: {err}"))
 }
 
 #[derive(Debug, Clone)]
@@ -448,7 +579,10 @@ pub fn find_ppocrv4_model_dir() -> Option<PathBuf> {
 
 pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> OcrResult {
     let text = normalize_ocr_text(&ocr_lines.join(""));
-    let mut result = OcrResult::default();
+    let mut result = OcrResult {
+        round_number: round_number_match(&text),
+        ..Default::default()
+    };
 
     for (alias, map_name) in MAP_ALIASES {
         if text.contains(alias) {
@@ -539,6 +673,7 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
     result.value_samples = value_sample_matches(&text);
 
     result.total_all = fix_trailing_noise(result.total_all, 150);
+    let fallback_ceiling = fallback_ceiling.filter(|count| *count > 0);
     let total_count = result
         .total_all
         .as_ref()
@@ -566,11 +701,28 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
                 .is_ok_and(|count| count <= total_count)
         });
     }
-    result.global_grid_total = fix_trailing_noise(result.global_grid_total, 3000);
-    result.blue_grid = fix_trailing_noise(result.blue_grid, 120);
-    result.purple_grid = fix_trailing_noise(result.purple_grid, 120);
-    result.gold_grid = fix_trailing_noise(result.gold_grid, 120);
-    result.red_grid = fix_trailing_noise(result.red_grid, 120);
+    let global_grid_max = total_count.map_or(3000, |count| 20 * count.max(1));
+    result.global_grid_total = fix_trailing_noise(result.global_grid_total, global_grid_max);
+    result.wg_grid = fix_trailing_noise(
+        result.wg_grid,
+        color_grid_noise_limit(&result.wg_count, total_count, 20),
+    );
+    result.blue_grid = fix_trailing_noise(
+        result.blue_grid,
+        color_grid_noise_limit(&result.blue_count, total_count, 20),
+    );
+    result.purple_grid = fix_trailing_noise(
+        result.purple_grid,
+        color_grid_noise_limit(&result.purple_count, total_count, 12),
+    );
+    result.gold_grid = fix_trailing_noise(
+        result.gold_grid,
+        color_grid_noise_limit(&result.gold_count, total_count, 18),
+    );
+    result.red_grid = fix_trailing_noise(
+        result.red_grid,
+        color_grid_noise_limit(&result.red_count, total_count, 16),
+    );
     result
 }
 
@@ -579,9 +731,7 @@ pub fn normalize_ocr_text(text: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
-        .replace('，', ".")
-        .replace('．', ".")
-        .replace(',', ".");
+        .replace(['，', '．', ','], ".");
     for (from, to) in [
         ("站拍", "竞拍"),
         ("章拍", "竞拍"),
@@ -614,6 +764,20 @@ fn try_match(text: &str, pattern: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn round_number_match(text: &str) -> Option<String> {
+    let re = Regex::new(r"第([1-5一二三四五])轮").ok()?;
+    let raw = re.captures(text)?.get(1)?.as_str();
+    let value = match raw {
+        "1" | "一" => 1,
+        "2" | "二" => 2,
+        "3" | "三" => 3,
+        "4" | "四" => 4,
+        "5" | "五" => 5,
+        _ => return None,
+    };
+    Some(value.to_string())
+}
+
 fn value_sample_matches(text: &str) -> Vec<OcrValueSample> {
     let Ok(re) = Regex::new(
         r"随机(?:选择|显示|抽取|挑选)的?(\d+)件(?:藏品|道具)平均价值(?:约为|为).*?([\d\.]+)",
@@ -630,7 +794,8 @@ fn value_sample_matches(text: &str) -> Vec<OcrValueSample> {
         };
         let sample = OcrValueSample {
             count: count.as_str().trim_matches('.').to_string(),
-            avg_value: avg_value.as_str().trim_matches('.').to_string(),
+            avg_value: normalize_decimal_number(avg_value.as_str())
+                .unwrap_or_else(|| avg_value.as_str().trim_matches('.').to_string()),
         };
         if sample.count.is_empty() || sample.avg_value.is_empty() {
             continue;
@@ -683,6 +848,32 @@ fn normalize_price_number(raw: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn normalize_decimal_number(raw: &str) -> Option<String> {
+    let raw = raw.trim_matches('.');
+    if raw.is_empty() {
+        return None;
+    }
+    let groups = raw
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if groups.len() > 2
+        && (1..=3).contains(&groups[0].len())
+        && groups[0].chars().all(|ch| ch.is_ascii_digit())
+        && groups[1..groups.len() - 1]
+            .iter()
+            .all(|part| part.len() == 3 && part.chars().all(|ch| ch.is_ascii_digit()))
+        && groups.last().is_some_and(|part| {
+            (1..=2).contains(&part.len()) && part.chars().all(|ch| ch.is_ascii_digit())
+        })
+    {
+        let integer = groups[..groups.len() - 1].join("");
+        let decimal = groups[groups.len() - 1];
+        return Some(format!("{integer}.{decimal}"));
+    }
+    Some(raw.to_string())
+}
+
 fn fix_color_count_overflow(
     text: Option<String>,
     total_count: i32,
@@ -731,6 +922,74 @@ fn fix_trailing_noise(text: Option<String>, absolute_max: i32) -> Option<String>
         text.truncate(text.len() - 1);
     }
     Some(text)
+}
+
+fn color_grid_noise_limit(
+    count_text: &Option<String>,
+    total_count: Option<i32>,
+    max_item_grid: i32,
+) -> i32 {
+    count_text
+        .as_deref()
+        .and_then(|text| text.parse::<i32>().ok())
+        .filter(|count| *count > 0)
+        .or(total_count)
+        .map(|count| max_item_grid * count.max(1))
+        .unwrap_or(3000)
+}
+
+fn save_crop_if_requested(image: &RgbImage, source: &Path) -> Result<PathBuf> {
+    let crop_path = temp_crop_path(source);
+    if should_save_crop(source) {
+        image
+            .save(&crop_path)
+            .with_context(|| format!("save OCR crop {}", crop_path.display()))?;
+        Ok(crop_path)
+    } else {
+        Ok(PathBuf::new())
+    }
+}
+
+fn ocr_resize_scale() -> u32 {
+    env::var("BIDKING_OCR_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=3).contains(value))
+        .unwrap_or(1)
+}
+
+fn ocr_resize_filter() -> FilterType {
+    match env::var("BIDKING_OCR_FILTER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "nearest" => FilterType::Nearest,
+        "triangle" => FilterType::Triangle,
+        "catmullrom" | "catmull" => FilterType::CatmullRom,
+        "gaussian" => FilterType::Gaussian,
+        _ => FilterType::Lanczos3,
+    }
+}
+
+fn use_legacy_ocr_regions() -> bool {
+    env::var("BIDKING_OCR_LEGACY_ROI").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn should_save_crop(source: &Path) -> bool {
+    let _ = source;
+    env::var("BIDKING_OCR_SAVE_CROP").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn temp_crop_path(source: &Path) -> PathBuf {

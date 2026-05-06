@@ -1,5 +1,7 @@
 use anyhow::Result;
-use bidking_rs::{CalcParams, ComboResult, load_embedded_core};
+use bidking_rs::{
+    CalcParams, ComboResult, infer_grid_from_average_for_quality, load_embedded_core,
+};
 
 #[derive(Debug, Clone)]
 struct GuiState {
@@ -25,7 +27,7 @@ impl GuiState {
     fn calculate_and_auto_fill(&mut self) -> Result<Vec<ComboResult>> {
         let mut core = load_embedded_core()?;
         let results = core.run(self.cp.clone())?;
-        auto_fill_unique_fields(&mut self.cp, &results);
+        auto_fill_unique_fields(&mut self.cp, &core.raw_results);
         Ok(results)
     }
 }
@@ -85,23 +87,23 @@ fn auto_fill_unique_fields(cp: &mut CalcParams, results: &[ComboResult]) {
     cp.gw_count = cp
         .gw_count
         .or_else(|| unique_i32(results, |r| r.greenwhite_count));
-    set_grid_from_average(&mut cp.gw_grid, cp.gw_count, cp.gw_avg);
+    set_grid_from_average(&mut cp.gw_grid, cp.gw_count, cp.gw_avg, None);
     cp.blue_count = cp
         .blue_count
         .or_else(|| unique_i32(results, |r| r.blue_count));
-    set_grid_from_average(&mut cp.blue_grid, cp.blue_count, cp.blue_avg);
+    set_grid_from_average(&mut cp.blue_grid, cp.blue_count, cp.blue_avg, Some(3));
     cp.purple_count = cp
         .purple_count
         .or_else(|| unique_i32(results, |r| r.purple_count));
-    set_grid_from_average(&mut cp.purple_grid, cp.purple_count, cp.purple_avg);
+    set_grid_from_average(&mut cp.purple_grid, cp.purple_count, cp.purple_avg, Some(4));
     cp.gold_count = cp
         .gold_count
         .or_else(|| unique_i32(results, |r| r.gold_count));
-    set_grid_from_average(&mut cp.gold_grid, cp.gold_count, cp.gold_avg);
+    set_grid_from_average(&mut cp.gold_grid, cp.gold_count, cp.gold_avg, Some(5));
     cp.red_count = cp
         .red_count
         .or_else(|| unique_i32(results, |r| r.red_count));
-    set_grid_from_average(&mut cp.red_grid, cp.red_count, cp.red_avg);
+    set_grid_from_average(&mut cp.red_grid, cp.red_count, cp.red_avg, Some(6));
 }
 
 fn unique_i32(results: &[ComboResult], f: impl Fn(&ComboResult) -> i32) -> Option<i32> {
@@ -110,21 +112,16 @@ fn unique_i32(results: &[ComboResult], f: impl Fn(&ComboResult) -> i32) -> Optio
     iter.all(|result| f(result) == first).then_some(first)
 }
 
-fn set_grid_from_average(target: &mut Option<f64>, count: Option<i32>, avg: Option<f64>) {
-    if let Some(grid) = infer_grid_from_average(count, avg) {
+fn set_grid_from_average(
+    target: &mut Option<f64>,
+    count: Option<i32>,
+    avg: Option<f64>,
+    quality: Option<i32>,
+) {
+    if let Some(grid) = count
+        .zip(avg)
+        .and_then(|(count, avg)| infer_grid_from_average_for_quality(count, avg, quality))
+    {
         *target = Some(grid as f64);
     }
-}
-
-fn infer_grid_from_average(count: Option<i32>, avg: Option<f64>) -> Option<i32> {
-    let count = count?;
-    let avg = avg?;
-    if count <= 0 || !avg.is_finite() || avg <= 0.0 {
-        return None;
-    }
-    let target = (avg * 100.0 + 1e-7).floor() as i32;
-    let mut matches = (count..=18 * count)
-        .filter(|grid| ((*grid as f64 * 100.0 / count as f64) + 1e-7).floor() as i32 == target);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
 }

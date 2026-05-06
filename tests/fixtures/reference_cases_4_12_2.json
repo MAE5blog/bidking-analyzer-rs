@@ -7,20 +7,20 @@
     "avg_grid_all": 2.35,
     "safety": 0.85,
     "expected": {
-      "combos": 973,
+      "combos": 971,
       "raw": 557845,
-      "bid_p25": 81729,
-      "bid_p50": 106145,
-      "bid_p75": 130527,
+      "bid_p25": 79191,
+      "bid_p50": 103878,
+      "bid_p75": 124991,
       "top": {
         "greenwhite": 36,
         "blue": 17,
         "purple": 4,
         "gold": 1,
         "red": 0,
-        "probability_6dp": 0.00793,
-        "final_value": 119823,
-        "total_grid_est_1dp": 134.6
+        "probability_6dp": 0.007937,
+        "final_value": 114170,
+        "total_grid_est_1dp": 135.1
       }
     }
   },
@@ -48,7 +48,7 @@
         "red": 0,
         "probability_6dp": 1.0,
         "final_value": 118125,
-        "total_grid_est_1dp": 147.1
+        "total_grid_est_1dp": 147.9
       }
     }
   },
@@ -62,11 +62,11 @@
     "gold_min": 1,
     "safety": 0.85,
     "expected": {
-      "combos": 2202,
+      "combos": 2201,
       "raw": 1215450,
-      "bid_p25": 183958,
-      "bid_p50": 236434,
-      "bid_p75": 279508,
+      "bid_p25": 176214,
+      "bid_p50": 225426,
+      "bid_p75": 279573,
       "top": {
         "greenwhite": 40,
         "blue": 25,
@@ -74,8 +74,8 @@
         "gold": 2,
         "red": 0,
         "probability_6dp": 0.00211,
-        "final_value": 202362,
-        "total_grid_est_1dp": 200.0
+        "final_value": 188855,
+        "total_grid_est_1dp": 200.5
       }
     }
   },
@@ -90,20 +90,20 @@
     "red_min": 1,
     "safety": 0.85,
     "expected": {
-      "combos": 28,
-      "raw": 28,
-      "bid_p25": 373991,
-      "bid_p50": 541798,
-      "bid_p75": 709606,
+      "combos": 650,
+      "raw": 2604,
+      "bid_p25": 484237,
+      "bid_p50": 652051,
+      "bid_p75": 819865,
       "top": {
-        "greenwhite": 0,
-        "blue": 0,
+        "greenwhite": 40,
+        "blue": 52,
         "purple": 11,
         "gold": 5,
         "red": 2,
-        "probability_6dp": 0.07728,
-        "final_value": 609154,
-        "total_grid_est_1dp": 51.6
+        "probability_6dp": 0.006526,
+        "final_value": 742386,
+        "total_grid_est_1dp": 263.0
       }
     }
   },
@@ -120,9 +120,9 @@
     "expected": {
       "combos": 1860,
       "raw": 43680,
-      "bid_p25": 1535906,
-      "bid_p50": 1813330,
-      "bid_p75": 2101007,
+      "bid_p25": 1523618,
+      "bid_p50": 1814206,
+      "bid_p75": 2130436,
       "top": {
         "greenwhite": 29,
         "blue": 24,
@@ -130,7 +130,7 @@
         "gold": 12,
         "red": 7,
         "probability_6dp": 0.002387,
-        "final_value": 2140450,
+        "final_value": 2140232,
         "total_grid_est_1dp": 271.0
       }
     }
@@ -147,10 +147,10 @@
     "safety": 0.85,
     "expected": {
       "combos": 2801,
-      "raw": 614520,
-      "bid_p25": 504642,
-      "bid_p50": 551352,
-      "bid_p75": 698347,
+      "raw": 600626,
+      "bid_p25": 521342,
+      "bid_p50": 671616,
+      "bid_p75": 820792,
       "top": {
         "greenwhite": 29,
         "blue": 22,
@@ -158,7 +158,7 @@
         "gold": 7,
         "red": 2,
         "probability_6dp": 0.001337,
-        "final_value": 636680,
+        "final_value": 625795,
         "total_grid_est_1dp": 232.5
       }
     }
