@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-gui.ps1
 仓库提供 GitHub Actions 发布流程：
 
 - 推送 `v*` tag 会自动构建并创建 GitHub Release
-- 也可以在 Actions 页面手动运行 `Build and release`，输入 tag，例如 `v0.2.0`
+- 也可以在 Actions 页面手动运行 `Build and release`，输入 tag，例如 `v0.2.1`
 
 Release 资产名为 `bidking-analyzer-windows-x64.zip`。解压后直接运行 `bidking-analyzer.exe`，包内已包含 OCR 所需的 PP-OCRv4 ONNX 模型和 ONNX Runtime DLL。
 
