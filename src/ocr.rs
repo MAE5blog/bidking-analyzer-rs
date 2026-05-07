@@ -394,7 +394,11 @@ pub fn scan_primary_screen_with_ppocrv4_onnx(fallback_ceiling: Option<i32>) -> R
 }
 
 pub fn warm_up_ppocrv4_onnx() -> Result<()> {
-    with_ppocrv4_engine(|_| Ok(()))
+    with_ppocrv4_engine(|engine| {
+        let image = warmup_image();
+        let _ = engine.detect(&image)?;
+        Ok(())
+    })
 }
 
 fn run_ppocrv4_onnx(
@@ -503,6 +507,27 @@ fn with_ppocrv4_engine<T>(f: impl FnOnce(&mut PpOcrV4Engine) -> Result<T>) -> Re
     f(&mut engine)
 }
 
+fn warmup_image() -> RgbImage {
+    let mut image = RgbImage::from_pixel(640, 360, Rgb([255, 255, 255]));
+    for row in 0..6 {
+        let y = 36 + row * 46;
+        draw_rect(&mut image, 40, y, 380, 16, Rgb([28, 28, 28]));
+        draw_rect(&mut image, 438, y, 92, 16, Rgb([28, 28, 28]));
+        draw_rect(&mut image, 548, y, 44, 16, Rgb([28, 28, 28]));
+    }
+    image
+}
+
+fn draw_rect(image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, color: Rgb<u8>) {
+    let max_x = (x + width).min(image.width());
+    let max_y = (y + height).min(image.height());
+    for yy in y..max_y {
+        for xx in x..max_x {
+            image.put_pixel(xx, yy, color);
+        }
+    }
+}
+
 fn init_onnxruntime(path: &Path) -> Result<()> {
     ORT_INIT_RESULT
         .get_or_init(|| {
@@ -578,7 +603,7 @@ pub fn find_ppocrv4_model_dir() -> Option<PathBuf> {
 }
 
 pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> OcrResult {
-    let text = normalize_ocr_text(&ocr_lines.join(""));
+    let text = normalize_count_question_mark_sevens(&normalize_ocr_text(&ocr_lines.join("")));
     let mut result = OcrResult {
         round_number: round_number_match(&text),
         ..Default::default()
@@ -599,10 +624,7 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
         }
     }
 
-    result.total_all = try_match(
-        &text,
-        r"(?:本场拍卖共有道具|本次竞拍的总藏品数量为).*?(\d+)",
-    );
+    result.total_all = try_match(&text, r"(?:本场拍卖共有道具|本次竞拍的总藏品数量为)(\d+)");
     result.global_avg_grid = try_match(&text, r"每件藏品平均占用的格子数量约为.*?([\d\.]+)");
     result.global_grid_total = try_match(
         &text,
@@ -610,7 +632,7 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
     );
     result.high_quality_total_count = try_match(
         &text,
-        r"本次竞拍共有品质(?:紫色、金色、红色|红色、金色、紫色|金色、紫色、红色)藏品.*?(\d+)",
+        r"本次竞拍共有品质(?:紫色、金色、红色|红色、金色、紫色|金色、紫色、红色)藏品(\d+)",
     );
     result.blue_grid = try_match(
         &text,
@@ -648,21 +670,21 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
     result.wg_avg = try_match(&text, r"所有白色和绿色品质藏品平均占位约.*?([\d\.]+)");
     result.blue_count = try_match(
         &text,
-        r"(?:蓝色品质藏品的总数量为|本场拍卖共有蓝色品质道具).*?(\d+)",
+        r"(?:蓝色品质藏品的总数量为|本场拍卖共有蓝色品质道具)(\d+)",
     );
     result.purple_count = try_match(
         &text,
-        r"(?:紫色品质藏品的总数量为|本场拍卖共有紫色品质道具).*?(\d+)",
+        r"(?:紫色品质藏品的总数量为|本场拍卖共有紫色品质道具)(\d+)",
     );
     result.gold_count = try_match(
         &text,
-        r"(?:(?:金色|橙色)品质藏品的总数量为|本场拍卖共有(?:金色|橙色)品质道具).*?(\d+)",
+        r"(?:(?:金色|橙色)品质藏品的总数量为|本场拍卖共有(?:金色|橙色)品质道具)(\d+)",
     );
     result.red_count = try_match(
         &text,
-        r"(?:红色品质藏品的总数量为|本场拍卖共有红色品质道具).*?(\d+)",
+        r"(?:红色品质藏品的总数量为|本场拍卖共有红色品质道具)(\d+)",
     );
-    result.wg_count = try_match(&text, r"本次竞拍白色和绿色品质藏品数量为.*?(\d+)");
+    result.wg_count = try_match(&text, r"本次竞拍白色和绿色品质藏品数量为(\d+)");
     result.gold_avg_value = try_match(
         &text,
         r"所有(?:金色|橙色)品质藏品的平均价值约为.*?([\d\.]+)",
@@ -672,7 +694,79 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
     result.min_value_floor = min_value_floor_match(&text);
     result.value_samples = value_sample_matches(&text);
 
-    result.total_all = fix_trailing_noise(result.total_all, 150);
+    warn_unreadable_number(
+        &text,
+        "总件数",
+        &["本场拍卖共有道具", "本次竞拍的总藏品数量为"],
+        &result.total_all,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "紫金红总数",
+        &[
+            "本次竞拍共有品质紫色、金色、红色藏品",
+            "本次竞拍共有品质红色、金色、紫色藏品",
+            "本次竞拍共有品质金色、紫色、红色藏品",
+        ],
+        &result.high_quality_total_count,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "白绿件数",
+        &["本次竞拍白色和绿色品质藏品数量为"],
+        &result.wg_count,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "蓝色件数",
+        &["蓝色品质藏品的总数量为", "本场拍卖共有蓝色品质道具"],
+        &result.blue_count,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "紫色件数",
+        &["紫色品质藏品的总数量为", "本场拍卖共有紫色品质道具"],
+        &result.purple_count,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "金色件数",
+        &[
+            "金色品质藏品的总数量为",
+            "橙色品质藏品的总数量为",
+            "本场拍卖共有金色品质道具",
+            "本场拍卖共有橙色品质道具",
+        ],
+        &result.gold_count,
+        false,
+        &mut result.warnings,
+    );
+    warn_unreadable_number(
+        &text,
+        "红色件数",
+        &["红色品质藏品的总数量为", "本场拍卖共有红色品质道具"],
+        &result.red_count,
+        false,
+        &mut result.warnings,
+    );
+
+    result.total_all = reject_invalid_i32(
+        result.total_all,
+        "总件数",
+        Some((1, "1")),
+        Some((150, "合理上限")),
+        &mut result.warnings,
+    );
     let fallback_ceiling = fallback_ceiling.filter(|count| *count > 0);
     let total_count = result
         .total_all
@@ -680,48 +774,181 @@ pub fn parse_ocr_lines(ocr_lines: &[String], fallback_ceiling: Option<i32>) -> O
         .and_then(|text| text.parse::<i32>().ok())
         .or(fallback_ceiling);
     if let Some(total_count) = total_count {
-        result.blue_count =
-            fix_color_count_overflow(result.blue_count, total_count, "蓝色", &mut result.warnings);
-        result.purple_count = fix_color_count_overflow(
-            result.purple_count,
-            total_count,
-            "紫色",
+        result.high_quality_total_count = reject_invalid_i32(
+            result.high_quality_total_count,
+            "紫金红总数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
             &mut result.warnings,
         );
-        result.gold_count =
-            fix_color_count_overflow(result.gold_count, total_count, "金色", &mut result.warnings);
-        result.red_count =
-            fix_color_count_overflow(result.red_count, total_count, "红色", &mut result.warnings);
-        result.wg_count =
-            fix_color_count_overflow(result.wg_count, total_count, "白绿", &mut result.warnings);
-        result.value_samples.retain(|sample| {
-            sample
-                .count
-                .parse::<i32>()
-                .is_ok_and(|count| count <= total_count)
-        });
+        result.blue_count = reject_invalid_i32(
+            result.blue_count,
+            "蓝色件数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
+            &mut result.warnings,
+        );
+        result.purple_count = reject_invalid_i32(
+            result.purple_count,
+            "紫色件数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
+            &mut result.warnings,
+        );
+        result.gold_count = reject_invalid_i32(
+            result.gold_count,
+            "金色件数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
+            &mut result.warnings,
+        );
+        result.red_count = reject_invalid_i32(
+            result.red_count,
+            "红色件数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
+            &mut result.warnings,
+        );
+        result.wg_count = reject_invalid_i32(
+            result.wg_count,
+            "白绿件数",
+            Some((0, "0")),
+            Some((total_count, "总件数")),
+            &mut result.warnings,
+        );
+        reject_color_count_sum_overflow(&mut result, total_count);
+        reject_low_quality_plus_high_quality_overflow(&mut result, total_count);
+        result.value_samples =
+            reject_invalid_value_samples(result.value_samples, total_count, &mut result.warnings);
     }
-    let global_grid_max = total_count.map_or(3000, |count| 20 * count.max(1));
-    result.global_grid_total = fix_trailing_noise(result.global_grid_total, global_grid_max);
-    result.wg_grid = fix_trailing_noise(
+
+    if let Some(high_count) = result
+        .high_quality_total_count
+        .as_ref()
+        .and_then(|text| text.parse::<i32>().ok())
+    {
+        result.purple_count = reject_invalid_i32(
+            result.purple_count,
+            "紫色件数",
+            Some((0, "0")),
+            Some((high_count, "紫金红总数")),
+            &mut result.warnings,
+        );
+        result.gold_count = reject_invalid_i32(
+            result.gold_count,
+            "金色件数",
+            Some((0, "0")),
+            Some((high_count, "紫金红总数")),
+            &mut result.warnings,
+        );
+        result.red_count = reject_invalid_i32(
+            result.red_count,
+            "红色件数",
+            Some((0, "0")),
+            Some((high_count, "紫金红总数")),
+            &mut result.warnings,
+        );
+        reject_high_quality_color_count_sum_overflow(&mut result, high_count);
+    }
+
+    result.global_avg_grid = reject_invalid_f64(
+        result.global_avg_grid,
+        "全部品均格",
+        Some((0.0, false)),
+        Some((20.0, "单件最大格数")),
+        &mut result.warnings,
+    );
+    result.global_grid_total = reject_invalid_f64(
+        result.global_grid_total,
+        "总格数",
+        total_count.map(|count| (count as f64, true)),
+        total_count.map(|count| ((20 * count.max(1)) as f64, "总件数对应最大格数")),
+        &mut result.warnings,
+    );
+    result.wg_grid = reject_invalid_f64(
         result.wg_grid,
-        color_grid_noise_limit(&result.wg_count, total_count, 20),
+        "白绿总格",
+        color_grid_min(&result.wg_count),
+        Some((
+            color_grid_noise_limit(&result.wg_count, total_count, 20) as f64,
+            "合理上限",
+        )),
+        &mut result.warnings,
     );
-    result.blue_grid = fix_trailing_noise(
+    result.blue_grid = reject_invalid_f64(
         result.blue_grid,
-        color_grid_noise_limit(&result.blue_count, total_count, 20),
+        "蓝色总格",
+        color_grid_min(&result.blue_count),
+        Some((
+            color_grid_noise_limit(&result.blue_count, total_count, 20) as f64,
+            "合理上限",
+        )),
+        &mut result.warnings,
     );
-    result.purple_grid = fix_trailing_noise(
+    result.purple_grid = reject_invalid_f64(
         result.purple_grid,
-        color_grid_noise_limit(&result.purple_count, total_count, 12),
+        "紫色总格",
+        color_grid_min(&result.purple_count),
+        Some((
+            color_grid_noise_limit(&result.purple_count, total_count, 12) as f64,
+            "合理上限",
+        )),
+        &mut result.warnings,
     );
-    result.gold_grid = fix_trailing_noise(
+    result.gold_grid = reject_invalid_f64(
         result.gold_grid,
-        color_grid_noise_limit(&result.gold_count, total_count, 18),
+        "金色总格",
+        color_grid_min(&result.gold_count),
+        Some((
+            color_grid_noise_limit(&result.gold_count, total_count, 18) as f64,
+            "合理上限",
+        )),
+        &mut result.warnings,
     );
-    result.red_grid = fix_trailing_noise(
+    result.red_grid = reject_invalid_f64(
         result.red_grid,
-        color_grid_noise_limit(&result.red_count, total_count, 16),
+        "红色总格",
+        color_grid_min(&result.red_count),
+        Some((
+            color_grid_noise_limit(&result.red_count, total_count, 16) as f64,
+            "合理上限",
+        )),
+        &mut result.warnings,
+    );
+    result.wg_avg = reject_invalid_f64(
+        result.wg_avg,
+        "白绿均格",
+        Some((0.0, true)),
+        Some((20.0, "单件最大格数")),
+        &mut result.warnings,
+    );
+    result.blue_avg = reject_invalid_f64(
+        result.blue_avg,
+        "蓝色均格",
+        Some((0.0, true)),
+        Some((20.0, "单件最大格数")),
+        &mut result.warnings,
+    );
+    result.purple_avg = reject_invalid_f64(
+        result.purple_avg,
+        "紫色均格",
+        Some((0.0, true)),
+        Some((12.0, "紫色单件最大格数")),
+        &mut result.warnings,
+    );
+    result.gold_avg = reject_invalid_f64(
+        result.gold_avg,
+        "金色均格",
+        Some((0.0, true)),
+        Some((18.0, "金色单件最大格数")),
+        &mut result.warnings,
+    );
+    result.red_avg = reject_invalid_f64(
+        result.red_avg,
+        "红色均格",
+        Some((0.0, true)),
+        Some((16.0, "红色单件最大格数")),
+        &mut result.warnings,
     );
     result
 }
@@ -762,6 +989,306 @@ fn try_match(text: &str, pattern: &str) -> Option<String> {
         .and_then(|captures| captures.get(1))
         .map(|m| m.as_str().trim_matches('.').to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_count_question_mark_sevens(text: &str) -> String {
+    let mut text = text.to_string();
+    for prefix in [
+        "本场拍卖共有道具",
+        "本次竞拍的总藏品数量为",
+        "本次竞拍共有品质紫色、金色、红色藏品",
+        "本次竞拍共有品质红色、金色、紫色藏品",
+        "本次竞拍共有品质金色、紫色、红色藏品",
+        "本次竞拍白色和绿色品质藏品数量为",
+        "蓝色品质藏品的总数量为",
+        "本场拍卖共有蓝色品质道具",
+        "紫色品质藏品的总数量为",
+        "本场拍卖共有紫色品质道具",
+        "金色品质藏品的总数量为",
+        "橙色品质藏品的总数量为",
+        "本场拍卖共有金色品质道具",
+        "本场拍卖共有橙色品质道具",
+        "红色品质藏品的总数量为",
+        "本场拍卖共有红色品质道具",
+    ] {
+        text = text.replace(&format!("{prefix}？件"), &format!("{prefix}7件"));
+        text = text.replace(&format!("{prefix}?件"), &format!("{prefix}7件"));
+        text = text.replace(&format!("{prefix}？"), &format!("{prefix}7"));
+        text = text.replace(&format!("{prefix}?"), &format!("{prefix}7"));
+    }
+    text
+}
+
+fn warn_unreadable_number(
+    text: &str,
+    label: &str,
+    prefixes: &[&str],
+    parsed: &Option<String>,
+    allow_decimal: bool,
+    warnings: &mut Vec<String>,
+) {
+    if parsed.is_some() {
+        return;
+    }
+    for prefix in prefixes {
+        let Some(index) = text.find(prefix) else {
+            continue;
+        };
+        let rest = &text[index + prefix.len()..];
+        let Some(first) = rest.chars().next() else {
+            continue;
+        };
+        if first.is_ascii_digit() || (allow_decimal && first == '.') {
+            continue;
+        }
+        push_warning_once(
+            warnings,
+            format!("{label}位置识别到非数字内容，已忽略该字段。"),
+        );
+        return;
+    }
+}
+
+fn reject_invalid_i32(
+    text: Option<String>,
+    label: &str,
+    min: Option<(i32, &str)>,
+    max: Option<(i32, &str)>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let text = text?;
+    let Ok(value) = text.parse::<i32>() else {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 不是有效整数，已忽略。"),
+        );
+        return None;
+    };
+    if let Some((min_value, min_name)) = min
+        && value < min_value
+    {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 小于{min_name}，已忽略。"),
+        );
+        return None;
+    }
+    if let Some((max_value, max_name)) = max
+        && value > max_value
+    {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 大于{max_name} {max_value}，已忽略。"),
+        );
+        return None;
+    }
+    Some(text)
+}
+
+fn reject_invalid_f64(
+    text: Option<String>,
+    label: &str,
+    min: Option<(f64, bool)>,
+    max: Option<(f64, &str)>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let text = text?;
+    let Ok(value) = text.parse::<f64>() else {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 不是有效数字，已忽略。"),
+        );
+        return None;
+    };
+    if !value.is_finite() {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 不是有效数字，已忽略。"),
+        );
+        return None;
+    }
+    if let Some((min_value, inclusive)) = min {
+        let invalid = if inclusive {
+            value < min_value
+        } else {
+            value <= min_value
+        };
+        if invalid {
+            let bound = if inclusive { "小于" } else { "不大于" };
+            push_warning_once(
+                warnings,
+                format!("{label}识别值 {text} {bound} {min_value}，已忽略。"),
+            );
+            return None;
+        }
+    }
+    if let Some((max_value, max_name)) = max
+        && value > max_value
+    {
+        push_warning_once(
+            warnings,
+            format!("{label}识别值 {text} 大于{max_name} {max_value}，已忽略。"),
+        );
+        return None;
+    }
+    Some(text)
+}
+
+fn reject_color_count_sum_overflow(result: &mut OcrResult, total_count: i32) {
+    let counts = [
+        ("白绿", &result.wg_count),
+        ("蓝色", &result.blue_count),
+        ("紫色", &result.purple_count),
+        ("金色", &result.gold_count),
+        ("红色", &result.red_count),
+    ];
+    let present = parsed_count_fields(&counts);
+    let sum = present.iter().map(|(_, value)| *value).sum::<i32>();
+    if sum <= total_count {
+        return;
+    }
+    let details = present
+        .iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    push_warning_once(
+        &mut result.warnings,
+        format!(
+            "各品质件数识别值合计 {sum} 大于总件数 {total_count}，已忽略本次识别到的各品质件数：{details}。"
+        ),
+    );
+    result.wg_count = None;
+    result.blue_count = None;
+    result.purple_count = None;
+    result.gold_count = None;
+    result.red_count = None;
+}
+
+fn reject_low_quality_plus_high_quality_overflow(result: &mut OcrResult, total_count: i32) {
+    let Some(high_count) = result
+        .high_quality_total_count
+        .as_ref()
+        .and_then(|text| text.parse::<i32>().ok())
+    else {
+        return;
+    };
+    let low_counts = [("白绿", &result.wg_count), ("蓝色", &result.blue_count)];
+    let present = parsed_count_fields(&low_counts);
+    let low_sum = present.iter().map(|(_, value)| *value).sum::<i32>();
+    let sum = low_sum + high_count;
+    if sum <= total_count {
+        return;
+    }
+    let details = present
+        .iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    push_warning_once(
+        &mut result.warnings,
+        format!(
+            "白绿/蓝色件数与紫金红总数合计 {sum} 大于总件数 {total_count}，已忽略本次识别到的低品质件数：{details}。"
+        ),
+    );
+    result.wg_count = None;
+    result.blue_count = None;
+}
+
+fn reject_high_quality_color_count_sum_overflow(result: &mut OcrResult, high_count: i32) {
+    let counts = [
+        ("紫色", &result.purple_count),
+        ("金色", &result.gold_count),
+        ("红色", &result.red_count),
+    ];
+    let present = parsed_count_fields(&counts);
+    let sum = present.iter().map(|(_, value)| *value).sum::<i32>();
+    if sum <= high_count {
+        return;
+    }
+    let details = present
+        .iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    push_warning_once(
+        &mut result.warnings,
+        format!(
+            "紫/金/红件数识别值合计 {sum} 大于紫金红总数 {high_count}，已忽略本次识别到的紫/金/红件数：{details}。"
+        ),
+    );
+    result.purple_count = None;
+    result.gold_count = None;
+    result.red_count = None;
+}
+
+fn parsed_count_fields<'a>(counts: &[(&'a str, &Option<String>)]) -> Vec<(&'a str, i32)> {
+    counts
+        .iter()
+        .filter_map(|(label, text)| {
+            text.as_ref()
+                .and_then(|text| text.parse::<i32>().ok())
+                .map(|value| (*label, value))
+        })
+        .collect()
+}
+
+fn reject_invalid_value_samples(
+    samples: Vec<OcrValueSample>,
+    total_count: i32,
+    warnings: &mut Vec<String>,
+) -> Vec<OcrValueSample> {
+    let mut valid = Vec::new();
+    for sample in samples {
+        let count = sample.count.parse::<i32>();
+        let avg_value = sample.avg_value.parse::<f64>();
+        match (count, avg_value) {
+            (Ok(count), Ok(avg_value))
+                if count > 0
+                    && count <= total_count
+                    && avg_value.is_finite()
+                    && avg_value >= 0.0 =>
+            {
+                valid.push(sample);
+            }
+            (Ok(count), _) if count <= 0 || count > total_count => {
+                push_warning_once(
+                    warnings,
+                    format!(
+                        "随机样本件数识别值 {} 不在 1 到总件数 {total_count} 之间，已忽略。",
+                        sample.count
+                    ),
+                );
+            }
+            _ => {
+                push_warning_once(
+                    warnings,
+                    format!(
+                        "随机样本识别值 件数={} 均价={} 不合规，已忽略。",
+                        sample.count, sample.avg_value
+                    ),
+                );
+            }
+        }
+    }
+    valid
+}
+
+fn color_grid_min(count_text: &Option<String>) -> Option<(f64, bool)> {
+    let count = count_text
+        .as_deref()
+        .and_then(|text| text.parse::<i32>().ok())?;
+    if count > 0 {
+        Some((count as f64, true))
+    } else {
+        Some((0.0, true))
+    }
+}
+
+fn push_warning_once(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
 }
 
 fn round_number_match(text: &str) -> Option<String> {
@@ -872,56 +1399,6 @@ fn normalize_decimal_number(raw: &str) -> Option<String> {
         return Some(format!("{integer}.{decimal}"));
     }
     Some(raw.to_string())
-}
-
-fn fix_color_count_overflow(
-    text: Option<String>,
-    total_count: i32,
-    label: &str,
-    warnings: &mut Vec<String>,
-) -> Option<String> {
-    let text = text?;
-    let Ok(value) = text.parse::<i32>() else {
-        return Some(text);
-    };
-    if value <= total_count {
-        return Some(text);
-    }
-    if text.len() <= 2 {
-        if label == "蓝色" && text.len() > 1 && (value as f64) > (total_count as f64 * 3.0 / 5.0)
-        {
-            let truncated = text[..text.len() - 1].to_string();
-            warnings.push(format!(
-                "{label}件数识别值 {text} 大于总件数 {total_count}，且超过总件数的五分之三，已截断为 {truncated}。"
-            ));
-            return Some(truncated);
-        }
-        return Some(text);
-    }
-    let mut truncated = text[..2].to_string();
-    warnings.push(format!(
-        "{label}件数识别值 {text} 大于总件数 {total_count}，已截断为 {truncated}。"
-    ));
-    if label == "蓝色"
-        && truncated.len() > 1
-        && truncated
-            .parse::<i32>()
-            .is_ok_and(|value| (value as f64) > (total_count as f64 * 3.0 / 5.0))
-    {
-        truncated.truncate(truncated.len() - 1);
-        warnings.push(format!(
-            "{label}件数截断后仍大于总件数的五分之三，已继续截断为 {truncated}。"
-        ));
-    }
-    Some(truncated)
-}
-
-fn fix_trailing_noise(text: Option<String>, absolute_max: i32) -> Option<String> {
-    let mut text = text?;
-    while text.len() > 1 && text.parse::<i32>().is_ok_and(|value| value > absolute_max) {
-        text.truncate(text.len() - 1);
-    }
-    Some(text)
 }
 
 fn color_grid_noise_limit(

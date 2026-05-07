@@ -145,7 +145,13 @@ fn parser_trims_large_color_grid_trailing_noise_against_color_count() {
 
     let result = parse_ocr_lines(&lines, None);
 
-    assert_eq!(result.blue_grid.as_deref(), Some("130"));
+    assert_eq!(result.blue_grid, None);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("蓝色") && warning.contains("已忽略"))
+    );
 }
 
 #[test]
@@ -165,6 +171,47 @@ fn parser_handles_noisy_ocr_lines_from_sample() {
     assert_eq!(result.purple_avg.as_deref(), Some("3.25"));
     assert_eq!(result.blue_avg.as_deref(), Some("3.3"));
     assert_eq!(result.wg_count.as_deref(), Some("16"));
+}
+
+#[test]
+fn parser_treats_count_question_mark_as_seven_when_ocr_confuses_digit() {
+    let lines = vec![
+        "第5轮".to_string(),
+        "本次竞拍白色和绿色品质藏品数量为？件".to_string(),
+        "所有紫色品质藏品总占位数为28格".to_string(),
+        "蓝色品质藏品的总数量为？".to_string(),
+        "所有金色品质藏品总占位数为14格".to_string(),
+    ];
+
+    let result = parse_ocr_lines(&lines, Some(28));
+
+    assert_eq!(result.wg_count.as_deref(), Some("7"));
+    assert_eq!(result.blue_count.as_deref(), Some("7"));
+    assert_eq!(result.purple_grid.as_deref(), Some("28"));
+    assert_eq!(result.gold_grid.as_deref(), Some("14"));
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn parser_ignores_count_sum_over_total_with_warning() {
+    let lines = vec![
+        "本次竞拍的总藏品数量为28件".to_string(),
+        "本次竞拍白色和绿色品质藏品数量为28件".to_string(),
+        "蓝色品质藏品的总数量为7件".to_string(),
+        "金色品质藏品的总数量为2件".to_string(),
+    ];
+
+    let result = parse_ocr_lines(&lines, None);
+
+    assert_eq!(result.wg_count, None);
+    assert_eq!(result.blue_count, None);
+    assert_eq!(result.gold_count, None);
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("合计 37") && warning.contains("已忽略"))
+    );
 }
 
 #[test]

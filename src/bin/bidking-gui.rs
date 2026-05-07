@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use bidking_rs::{
-    CalcParams, ValueSample, grid_matches_average_for_quality, grid_matches_average_with_sizes,
-    infer_grid_from_average_for_quality, infer_grid_from_average_with_sizes, load_embedded_core,
-    load_embedded_static_data, normalize_calc_params, ocr, recommended_bid_value,
+    BidKingCore, CalcParams, ValueSample, grid_matches_average_for_quality,
+    grid_matches_average_with_sizes, infer_grid_from_average_for_quality,
+    infer_grid_from_average_with_sizes, load_embedded_core, load_embedded_static_data,
+    normalize_calc_params, ocr, recommended_bid_value,
 };
 use eframe::egui;
 use std::env;
@@ -104,6 +105,7 @@ struct CalculationOutput {
     red_range: Option<CountRange>,
     composition_lines: Vec<String>,
     high_quality_only: bool,
+    has_ocr_warning: bool,
 }
 
 impl CalculationOutput {
@@ -164,6 +166,7 @@ struct BidKingGui {
     window_topmost: bool,
     mini_mode: bool,
     global_hotkeys: Option<GlobalHotkeys>,
+    core: Option<BidKingCore>,
 }
 
 struct GlobalHotkeys {
@@ -250,6 +253,7 @@ impl BidKingGui {
             window_topmost: false,
             mini_mode: false,
             global_hotkeys: None,
+            core: None,
         }
     }
 }
@@ -376,8 +380,24 @@ impl BidKingGui {
     fn with_context(ctx: &egui::Context) -> Self {
         let mut app = Self::default();
         app.install_global_hotkeys(ctx);
+        app.preload_core();
         start_ocr_warmup(ctx);
         app
+    }
+
+    fn preload_core(&mut self) {
+        if let Err(err) = self.core_mut()
+            && self.status.trim().is_empty()
+        {
+            self.status = format!("内置计算数据预加载失败: {err:#}");
+        }
+    }
+
+    fn core_mut(&mut self) -> Result<&mut BidKingCore> {
+        if self.core.is_none() {
+            self.core = Some(load_embedded_core()?);
+        }
+        Ok(self.core.as_mut().expect("core just initialized"))
     }
 
     fn install_global_hotkeys(&mut self, ctx: &egui::Context) {
@@ -780,9 +800,27 @@ impl BidKingGui {
 
         section(ui, "出价参考", |ui| {
             ui.columns(3, |cols| {
-                price_card(&mut cols[0], "保守出价 (P25)", output.p25, color_green());
-                price_card(&mut cols[1], "均衡出价 (P50)", output.p50, color_orange());
-                price_card(&mut cols[2], "激进出价 (P75)", output.p75, color_red());
+                price_card(
+                    &mut cols[0],
+                    "保守出价 (P25)",
+                    output.p25,
+                    color_green(),
+                    output.has_ocr_warning,
+                );
+                price_card(
+                    &mut cols[1],
+                    "均衡出价 (P50)",
+                    output.p50,
+                    color_orange(),
+                    output.has_ocr_warning,
+                );
+                price_card(
+                    &mut cols[2],
+                    "激进出价 (P75)",
+                    output.p75,
+                    color_red(),
+                    output.has_ocr_warning,
+                );
             });
         });
         ui.add_space(12.0);
@@ -849,9 +887,27 @@ impl BidKingGui {
         section(ui, "出价参考", |ui| {
             ui.columns(3, |cols| {
                 if let Some(output) = &self.output {
-                    price_card(&mut cols[0], "保守出价 (P25)", output.p25, color_green());
-                    price_card(&mut cols[1], "均衡出价 (P50)", output.p50, color_orange());
-                    price_card(&mut cols[2], "激进出价 (P75)", output.p75, color_red());
+                    price_card(
+                        &mut cols[0],
+                        "保守出价 (P25)",
+                        output.p25,
+                        color_green(),
+                        output.has_ocr_warning,
+                    );
+                    price_card(
+                        &mut cols[1],
+                        "均衡出价 (P50)",
+                        output.p50,
+                        color_orange(),
+                        output.has_ocr_warning,
+                    );
+                    price_card(
+                        &mut cols[2],
+                        "激进出价 (P75)",
+                        output.p75,
+                        color_red(),
+                        output.has_ocr_warning,
+                    );
                 } else {
                     price_placeholder(&mut cols[0], "保守出价 (P25)", color_green());
                     price_placeholder(&mut cols[1], "均衡出价 (P50)", color_orange());
@@ -933,7 +989,7 @@ impl BidKingGui {
                 let warnings = if scan.parsed.warnings.is_empty() {
                     String::new()
                 } else {
-                    format!("；{}", scan.parsed.warnings.join("；"))
+                    format!("；警告：{}", scan.parsed.warnings.join("；"))
                 };
                 let scan_title = scan
                     .parsed
@@ -951,7 +1007,7 @@ impl BidKingGui {
                     warnings
                 );
                 match self.calculate_inner() {
-                    Ok((output, auto_fill)) => {
+                    Ok((mut output, auto_fill)) => {
                         let scope_warning = output.scope_warning_suffix();
                         let auto_fill_status = if auto_fill.fields > 0 {
                             format!("；计算后回填 {} 个唯一件数/格数字段", auto_fill.fields)
@@ -959,6 +1015,7 @@ impl BidKingGui {
                             String::new()
                         };
                         let timing_status = debug_timing_suffix(&scan, Some(output.elapsed_ms));
+                        output.has_ocr_warning = !scan.parsed.warnings.is_empty();
                         self.status = format!(
                             "{}{}。已自动计算出价：当前地图: {}{}{}。",
                             scan_status,
@@ -1175,12 +1232,13 @@ impl BidKingGui {
         updated
     }
 
-    fn selected_map_grid_sizes(&self) -> Option<MapGridSizes> {
-        let mut core = load_embedded_core().ok()?;
+    fn selected_map_grid_sizes(&mut self) -> Option<MapGridSizes> {
+        let selected_map_id = self.selected_map_id.clone();
+        let core = self.core_mut().ok()?;
         let nest_id = core
             .static_data
             .map_to_nest
-            .get(&self.selected_map_id)
+            .get(&selected_map_id)
             .cloned()?;
         Some(MapGridSizes {
             blue: core.loader.get_map_grid_sizes_by_quality(Some(&nest_id), 3),
@@ -1259,16 +1317,18 @@ impl BidKingGui {
 
     fn calculate_inner(&mut self) -> Result<(CalculationOutput, AutoFillSummary)> {
         let start = Instant::now();
-        let mut core = load_embedded_core()?;
         if let Some(tier) = tier_from_map_id(&self.selected_map_id) {
             self.tier = tier.to_string();
         }
-        let nest_id = core
-            .static_data
-            .map_to_nest
-            .get(&self.selected_map_id)
-            .cloned()
-            .with_context(|| format!("未知地图 {}", self.selected_map_id))?;
+        let selected_map_id = self.selected_map_id.clone();
+        let nest_id = {
+            let core = self.core_mut()?;
+            core.static_data
+                .map_to_nest
+                .get(&selected_map_id)
+                .cloned()
+                .with_context(|| format!("未知地图 {}", selected_map_id))?
+        };
         let display_count = MAX_VISIBLE_COMBOS;
         let total_count = parse_optional_i32(&self.total)?.unwrap_or_default();
         let high_quality_count = parse_optional_i32(&self.high_quality_count)?;
@@ -1318,33 +1378,47 @@ impl BidKingGui {
             manual_gold_per_grid: parse_optional_f64(&self.manual_gold_grid)?,
             value_samples: self.parse_value_samples()?,
         });
-        let results = core.run(cp.clone())?;
+        let (results, raw_results, raw_len, p25, p50, p75, composition_lines, grid_sizes) = {
+            let core = self.core_mut()?;
+            let results = core.run(cp.clone())?;
+            let raw_results = core.raw_results.clone();
+            let raw_len = core.raw_results.len();
+            let (p25, p50, p75) = core.price_range_for_last_run(&cp);
+            let composition_lines = results
+                .first()
+                .map(|top| core.combo_composition_lines(top, &cp))
+                .unwrap_or_default();
+            let grid_sizes = MapGridSizes {
+                blue: core
+                    .loader
+                    .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 3),
+                purple: core
+                    .loader
+                    .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 4),
+                gold: core
+                    .loader
+                    .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 5),
+                red: core
+                    .loader
+                    .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 6),
+            };
+            (
+                results,
+                raw_results,
+                raw_len,
+                p25,
+                p50,
+                p75,
+                composition_lines,
+                grid_sizes,
+            )
+        };
         let high_quality_only =
             cp.total_count <= 0 && cp.high_quality_count.unwrap_or_default() > 0;
-        let (p25, p50, p75) = core.price_range_for_last_run(&cp);
         let purple_range = range_for(&results, |r| r.purple_count);
         let gold_range = range_for(&results, |r| r.gold_count);
         let red_range = range_for(&results, |r| r.red_count);
-        let composition_lines = results
-            .first()
-            .map(|top| core.combo_composition_lines(top, &cp))
-            .unwrap_or_default();
-        let grid_sizes = MapGridSizes {
-            blue: core
-                .loader
-                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 3),
-            purple: core
-                .loader
-                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 4),
-            gold: core
-                .loader
-                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 5),
-            red: core
-                .loader
-                .get_map_grid_sizes_by_quality(Some(&cp.map_nest_id), 6),
-        };
-        let auto_fill =
-            self.apply_unique_fields(&core.raw_results, &grid_sizes, cp.total_count > 0);
+        let auto_fill = self.apply_unique_fields(&raw_results, &grid_sizes, cp.total_count > 0);
         let rows = results
             .iter()
             .take(display_count)
@@ -1363,7 +1437,7 @@ impl BidKingGui {
         Ok((
             CalculationOutput {
                 combos: results.len(),
-                raw: core.raw_results.len(),
+                raw: raw_len,
                 p25: recommended_bid_value(p25, &cp).round() as i64,
                 p50: recommended_bid_value(p50, &cp).round() as i64,
                 p75: recommended_bid_value(p75, &cp).round() as i64,
@@ -1375,6 +1449,7 @@ impl BidKingGui {
                 map_label,
                 composition_lines,
                 high_quality_only,
+                has_ocr_warning: false,
             },
             auto_fill,
         ))
@@ -1433,6 +1508,7 @@ impl BidKingGui {
     fn reset_conditions(&mut self) {
         let maps = self.maps.clone();
         let global_hotkeys = self.global_hotkeys.take();
+        let core = self.core.take();
         let window_topmost = self.window_topmost;
         let mini_mode = self.mini_mode;
         let mut fresh = Self::new_form_state();
@@ -1440,6 +1516,7 @@ impl BidKingGui {
         fresh.window_topmost = window_topmost;
         fresh.mini_mode = mini_mode;
         fresh.global_hotkeys = global_hotkeys;
+        fresh.core = core;
         fresh.status = "已重置条件。".to_string();
         *self = fresh;
     }
@@ -1599,14 +1676,48 @@ fn pill_label(ui: &mut egui::Ui, text: &str, accent: egui::Color32) {
 }
 
 fn status_bar(ui: &mut egui::Ui, text: &str) {
+    let warning = status_text_is_warning(text);
+    let (fill, stroke, text_color) = if warning {
+        (
+            egui::Color32::from_rgb(62, 35, 22),
+            egui::Stroke::new(1.4, color_orange()),
+            color_gold(),
+        )
+    } else {
+        (
+            color_panel_alt(),
+            egui::Stroke::new(1.0, color_border()),
+            color_muted(),
+        )
+    };
     egui::Frame::default()
-        .fill(color_panel_alt())
-        .stroke(egui::Stroke::new(1.0, color_border()))
+        .fill(fill)
+        .stroke(stroke)
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(14.0).color(color_muted()));
+            ui.label(
+                egui::RichText::new(text)
+                    .size(14.0)
+                    .strong()
+                    .color(text_color),
+            );
         });
+}
+
+fn status_text_is_warning(text: &str) -> bool {
+    [
+        "警告",
+        "失败",
+        "不可用",
+        "不合规",
+        "已忽略",
+        "不能",
+        "必须",
+        "需要",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn dark_widget_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1718,10 +1829,14 @@ fn range_label(ui: &mut egui::Ui, label: &str, range: Option<CountRange>, color:
     });
 }
 
-fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32) {
+fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32, warning: bool) {
     egui::Frame::default()
         .fill(color_card())
-        .stroke(egui::Stroke::new(1.0, color_border()))
+        .stroke(if warning {
+            egui::Stroke::new(1.4, color_orange())
+        } else {
+            egui::Stroke::new(1.0, color_border())
+        })
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -1729,14 +1844,22 @@ fn price_card(ui: &mut egui::Ui, label: &str, value: i64, accent: egui::Color32)
             ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new(label).color(color_muted()).size(13.0));
                 ui.label(
-                    egui::RichText::new(format_number(value))
+                    egui::RichText::new(format_price_value(value, warning))
                         .size(30.0)
                         .strong()
-                        .color(accent),
+                        .color(if warning { color_gold() } else { accent }),
                 );
                 accent_bar(ui, accent);
             });
         });
+}
+
+fn format_price_value(value: i64, warning: bool) -> String {
+    if warning {
+        format!("! {}", format_number(value))
+    } else {
+        format_number(value)
+    }
 }
 
 fn price_placeholder(ui: &mut egui::Ui, label: &str, accent: egui::Color32) {
@@ -2650,6 +2773,60 @@ mod tests {
     }
 
     #[test]
+    fn warning_price_value_has_exclamation_prefix() {
+        assert_eq!(format_price_value(12345, false), "12,345");
+        assert_eq!(format_price_value(12345, true), "! 12,345");
+    }
+
+    #[test]
+    fn status_text_detects_ocr_warnings() {
+        assert!(status_text_is_warning("视觉扫描完成；警告：蓝色件数已忽略"));
+        assert!(!status_text_is_warning(
+            "地图实算完成，已自动回填 1 个字段。"
+        ));
+    }
+
+    #[test]
+    fn invalid_ocr_count_does_not_overwrite_existing_field() {
+        let result = ocr::parse_ocr_lines(
+            &[
+                "本次竞拍的总藏品数量为28件".to_string(),
+                "本次竞拍白色和绿色品质藏品数量为35件".to_string(),
+            ],
+            None,
+        );
+        let mut app = BidKingGui {
+            gw_count: "7".to_string(),
+            ..Default::default()
+        };
+
+        app.apply_ocr_result(&result);
+
+        assert_eq!(result.wg_count, None);
+        assert_eq!(app.gw_count, "7");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("白绿件数") && warning.contains("已忽略"))
+        );
+    }
+
+    #[test]
+    fn reset_preserves_loaded_core_cache() {
+        let mut app = BidKingGui::default();
+
+        app.core_mut().unwrap();
+        assert!(app.core.is_some());
+        app.gw_count = "7".to_string();
+        app.reset_conditions();
+
+        assert!(app.core.is_some());
+        assert_eq!(app.gw_count, "");
+        assert_eq!(app.status, "已重置条件。");
+    }
+
+    #[test]
     fn gui_can_calculate_from_high_quality_total_without_total_count() {
         let mut app = BidKingGui {
             total: "0".to_string(),
@@ -2670,6 +2847,29 @@ mod tests {
                 .iter()
                 .all(|row| row.greenwhite == 0 && row.blue == 0)
         );
+    }
+
+    #[test]
+    fn case5_high_quality_total_ignores_global_average_without_total_count() {
+        let mut app = BidKingGui {
+            total: "0".to_string(),
+            ..Default::default()
+        };
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("1".to_string()),
+            map_name: Some("超市快递".to_string()),
+            high_quality_total_count: Some("3".to_string()),
+            global_avg_grid: Some("2.40".to_string()),
+            ..Default::default()
+        });
+        let (output, _) = app.calculate_inner().unwrap();
+
+        assert_eq!(app.high_quality_count, "3");
+        assert_eq!(app.avg_grid_all, "2.40");
+        assert!(!output.rows.is_empty());
+        assert!(output.high_quality_only);
+        assert!(output.p50 > 0);
     }
 
     #[test]

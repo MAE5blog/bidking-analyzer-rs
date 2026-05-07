@@ -1511,8 +1511,7 @@ impl BidKingCore {
             combo.probability = (combo.log_w - max_l).exp() / denom;
         }
         self.raw_results = combos.clone();
-        self.raw_results
-            .sort_by(|a, b| fcmp(b.probability, a.probability));
+        self.raw_results.sort_by(combo_probability_order);
         self.price_range_results = price_range_source(&self.raw_results, keep_all_for_price_range);
         let mut filtered: Vec<ComboResult> = combos
             .into_iter()
@@ -1527,7 +1526,7 @@ impl BidKingCore {
                 combo.probability /= prob_sum;
             }
         }
-        filtered.sort_by(|a, b| fcmp(b.probability, a.probability));
+        filtered.sort_by(combo_probability_order);
         Ok(filtered)
     }
 
@@ -2688,6 +2687,10 @@ fn log_binom_p(n: i32, k: i32, p: f64) -> f64 {
 }
 
 pub fn normalize_calc_params(mut cp: CalcParams) -> CalcParams {
+    if high_quality_only_mode(&cp) {
+        cp.avg_grid_all = None;
+        return cp;
+    }
     if cp.total_grid_target.is_none() && cp.avg_grid_all.is_some() && cp.total_count > 0 {
         cp.total_grid_target = cp.avg_grid_all.map(|avg| avg * cp.total_count as f64);
     }
@@ -3860,6 +3863,17 @@ fn fcmp(a: f64, b: f64) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
+fn combo_probability_order(a: &ComboResult, b: &ComboResult) -> Ordering {
+    fcmp(b.probability, a.probability)
+        .then_with(|| a.greenwhite_count.cmp(&b.greenwhite_count))
+        .then_with(|| a.blue_count.cmp(&b.blue_count))
+        .then_with(|| a.purple_count.cmp(&b.purple_count))
+        .then_with(|| a.gold_count.cmp(&b.gold_count))
+        .then_with(|| a.red_count.cmp(&b.red_count))
+        .then_with(|| fcmp(a.total_grid_est, b.total_grid_est))
+        .then_with(|| fcmp(a.final_value, b.final_value))
+}
+
 pub fn load_core(
     data_path: impl AsRef<Path>,
     static_path: impl AsRef<Path>,
@@ -4194,6 +4208,32 @@ mod tests {
                 .all(|r| r.purple_count + r.gold_count + r.red_count == 6)
         );
         assert!(p25 > 0.0 && p50 >= p25 && p75 >= p50);
+    }
+
+    #[test]
+    fn high_quality_only_ignores_global_average_without_total_count() {
+        let cp = normalize_calc_params(CalcParams {
+            total_count: 0,
+            high_quality_count: Some(3),
+            avg_grid_all: Some(2.4),
+            ..Default::default()
+        });
+
+        assert_eq!(cp.avg_grid_all, None);
+        validate_calc_params(&cp).unwrap();
+    }
+
+    #[test]
+    fn high_quality_only_still_rejects_global_total_grid_without_total_count() {
+        let cp = normalize_calc_params(CalcParams {
+            total_count: 0,
+            high_quality_count: Some(3),
+            total_grid_target: Some(8.0),
+            ..Default::default()
+        });
+
+        let err = validate_calc_params(&cp).unwrap_err();
+        assert!(format!("{err:#}").contains("总格数需要总件数"));
     }
 
     #[test]
