@@ -2248,8 +2248,11 @@ impl BidKingCore {
         };
         let sd = variance.max(0.0).sqrt();
         if let Some(floor) = min_value_floor {
-            if sd > 0.0 && (p75 - p25).abs() <= 1.0 {
-                p25 = (p50 - 0.3373 * sd).max(floor).min(p50);
+            if sd > 0.0 && (p50 - p25).abs() <= 1.0 {
+                let lower = (p50 - 0.3373 * sd).max(floor).min(p50);
+                p25 = (p25 * 0.65).max(p25.min(lower)).max(floor).min(p50);
+            }
+            if sd > 0.0 && (p75 - p50).abs() <= 1.0 {
                 p75 = p75.max(p50 + 0.3373 * sd);
             }
             return (p25, p50, p75);

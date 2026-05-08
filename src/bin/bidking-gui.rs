@@ -22,6 +22,7 @@ const FULL_WINDOW_MAX_SIZE: egui::Vec2 = egui::vec2(4096.0, 2160.0);
 const MINI_WINDOW_SIZE: egui::Vec2 = egui::vec2(624.0, 700.0);
 const MINI_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(540.0, 420.0);
 const MINI_WINDOW_MAX_SIZE: egui::Vec2 = egui::vec2(624.0, 711.0);
+const APP_TITLE: &str = concat!("竞拍之王估价器 v", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Default)]
 struct MapGridSizes {
@@ -34,14 +35,14 @@ struct MapGridSizes {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("竞拍之王估价器")
+            .with_title(APP_TITLE)
             .with_inner_size(FULL_WINDOW_SIZE)
             .with_min_inner_size(FULL_WINDOW_MIN_SIZE)
             .with_max_inner_size(FULL_WINDOW_MAX_SIZE),
         ..Default::default()
     };
     eframe::run_native(
-        "竞拍之王估价器",
+        APP_TITLE,
         options,
         Box::new(|cc| {
             install_chinese_font(&cc.egui_ctx);
@@ -3012,5 +3013,85 @@ mod tests {
         });
         let (round5, _) = app.calculate_inner().unwrap();
         assert!(!round5.rows.is_empty());
+    }
+
+    #[test]
+    fn case7_gui_sequence_keeps_p25_below_p50_after_round3() {
+        let mut app = BidKingGui::default();
+        app.reload_maps().unwrap();
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("1".to_string()),
+            map_name: Some("极客改造屋".to_string()),
+            total_all: Some("24".to_string()),
+            wg_grid: Some("6".to_string()),
+            gold_grid: Some("6".to_string()),
+            ..Default::default()
+        });
+        let (round1, _) = app.calculate_inner().unwrap();
+        assert!(!round1.rows.is_empty());
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("2".to_string()),
+            map_name: Some("极客改造屋".to_string()),
+            total_all: Some("24".to_string()),
+            wg_grid: Some("6".to_string()),
+            wg_avg: Some("1.5".to_string()),
+            gold_grid: Some("6".to_string()),
+            gold_avg: Some("6".to_string()),
+            ..Default::default()
+        });
+        let (round2, _) = app.calculate_inner().unwrap();
+        assert!(!round2.rows.is_empty());
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("3".to_string()),
+            map_name: Some("极客改造屋".to_string()),
+            total_all: Some("24".to_string()),
+            wg_grid: Some("6".to_string()),
+            wg_avg: Some("1.5".to_string()),
+            blue_count: Some("13".to_string()),
+            purple_avg: Some("3.5".to_string()),
+            gold_avg: Some("6".to_string()),
+            min_value_floor: Some("2133".to_string()),
+            ..Default::default()
+        });
+        let (round3, _) = app.calculate_inner().unwrap();
+        assert!(
+            round3.p25 < round3.p50 && round3.p50 < round3.p75,
+            "round3 bids should be separated: p25={}, p50={}, p75={}",
+            round3.p25,
+            round3.p50,
+            round3.p75
+        );
+        assert_eq!(
+            (round3.p25, round3.p50, round3.p75),
+            (78_503, 120_602, 375_490)
+        );
+
+        app.apply_ocr_result(&ocr::OcrResult {
+            round_number: Some("4".to_string()),
+            map_name: Some("极客改造屋".to_string()),
+            wg_grid: Some("6".to_string()),
+            wg_avg: Some("1.5".to_string()),
+            blue_count: Some("13".to_string()),
+            blue_avg: Some("3.76".to_string()),
+            purple_avg: Some("3.5".to_string()),
+            gold_avg: Some("6".to_string()),
+            min_value_floor: Some("2133".to_string()),
+            ..Default::default()
+        });
+        let (round4, _) = app.calculate_inner().unwrap();
+        assert!(
+            round4.p25 < round4.p50 && round4.p50 < round4.p75,
+            "round4 bids should be separated: p25={}, p50={}, p75={}",
+            round4.p25,
+            round4.p50,
+            round4.p75
+        );
+        assert_eq!(
+            (round4.p25, round4.p50, round4.p75),
+            (87_306, 134_144, 389_032)
+        );
     }
 }

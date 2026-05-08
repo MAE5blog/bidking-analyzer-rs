@@ -623,6 +623,52 @@ fn min_value_floor_filters_low_value_combos_before_percentiles() -> Result<()> {
 }
 
 #[test]
+fn case7_min_value_floor_does_not_collapse_p25_to_p50() -> Result<()> {
+    let mut core = load_embedded_core()?;
+    let round3 = CalcParams {
+        tier: "104".to_string(),
+        map_nest_id: "2040".to_string(),
+        total_count: 24,
+        gw_grid: Some(6.0),
+        gw_avg: Some(1.5),
+        blue_count: Some(13),
+        purple_avg: Some(3.5),
+        gold_grid: Some(6.0),
+        gold_avg: Some(6.0),
+        min_value_floor: Some(2133.0),
+        safety_factor: 0.85,
+        max_show: 10,
+        ..Default::default()
+    };
+    let results = core.run(round3.clone())?;
+    assert_eq!(results.len(), 3);
+    let (p25, p50, p75) = core.price_range_for_last_run(&round3);
+    assert!(
+        p25 < p50 && p50 < p75,
+        "case7 round3 should keep conservative, median and aggressive bids separated: p25={p25}, p50={p50}, p75={p75}"
+    );
+    assert_eq!(recommended_bid_value(p25, &round3).round() as i64, 78_503);
+    assert_eq!(recommended_bid_value(p50, &round3).round() as i64, 120_602);
+    assert_eq!(recommended_bid_value(p75, &round3).round() as i64, 375_490);
+
+    let round4 = CalcParams {
+        blue_avg: Some(3.76),
+        ..round3
+    };
+    let results = core.run(round4.clone())?;
+    assert_eq!(results.len(), 3);
+    let (p25, p50, p75) = core.price_range_for_last_run(&round4);
+    assert!(
+        p25 < p50 && p50 < p75,
+        "case7 round4 should keep conservative, median and aggressive bids separated: p25={p25}, p50={p50}, p75={p75}"
+    );
+    assert_eq!(recommended_bid_value(p25, &round4).round() as i64, 87_306);
+    assert_eq!(recommended_bid_value(p50, &round4).round() as i64, 134_144);
+    assert_eq!(recommended_bid_value(p75, &round4).round() as i64, 389_032);
+    Ok(())
+}
+
+#[test]
 fn recommended_bid_keeps_game_floor_as_lower_bound() {
     let cp = CalcParams {
         min_value_floor: Some(371_868.0),
